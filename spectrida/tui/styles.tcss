@@ -1,0 +1,70 @@
+/* spectrIDA — cyberpunk theme. cyan #00d4ff · purple #8b5cf6 · orange #f97316 */
+
+Screen { background: #0b0d16; color: #c9d1d9; }
+
+#header {
+    dock: top; height: 1; background: #161b27; color: #00d4ff;
+    text-style: bold; padding: 0 2; layout: horizontal;
+}
+#header-title { color: #00d4ff; text-style: bold; width: 1fr; }
+#header-status { color: #8b5cf6; text-align: right; }
+
+#statusbar {
+    dock: bottom; height: 1; background: #11131f; color: #475569; padding: 0 2;
+}
+#footer {
+    dock: bottom; height: 1; background: #161b27; padding: 0 2; color: #64748b;
+}
+
+/* ── browser layout ── */
+#browser-body { layout: horizontal; height: 1fr; }
+#func-panel { width: 36%; min-width: 28; border-right: solid #1f2430; }
+#func-search { border: round #1f2430; background: #0f1117; color: #00d4ff; }
+#func-search:focus { border: round #00d4ff; }
+#func-count { color: #475569; padding: 0 1; height: 1; }
+
+FuncList { height: 1fr; background: #0b0d16; }
+
+#right-panel { width: 1fr; layout: vertical; }
+#disasm-header { height: 1; background: #0f1117; color: #f97316; text-style: bold; padding: 0 1; }
+DisasmPane { height: 1fr; background: #0b0d16; padding: 0 1; }
+
+#model-header { height: 1; background: #0f1117; color: #8b5cf6; text-style: bold; padding: 0 1; }
+#model-pane { height: 45%; background: #080a10; padding: 0 1; }
+#model-hint { color: #475569; }
+#model-result { color: #22c55e; text-style: bold; }
+#model-reason { color: #6b7280; }
+#model-spinner { color: #8b5cf6; }
+
+/* ── analyze screen ── */
+#analyze-binary { height: 1; color: #00d4ff; text-style: bold; padding: 0 2; }
+#shard-grid { height: 4; padding: 1 2; layout: grid; grid-size: 8 2; grid-gutter: 1; }
+.shard-cell { content-align: center middle; background: #11131f; color: #475569; border: round #1f2430; }
+.shard-cell.running { background: #0f2235; color: #00d4ff; border: round #00d4ff; }
+.shard-cell.done { background: #0f2a1a; color: #22c55e; border: round #22c55e; }
+.shard-cell.error { background: #2a0f12; color: #ef4444; border: round #ef4444; }
+#analyze-stats { height: 1; color: #8b5cf6; padding: 0 2; }
+#analyze-log { height: 1fr; background: #080a10; color: #4a5568; padding: 0 1; }
+
+/* ── onboarding ── */
+#onboard-box { height: 1fr; padding: 2 6; }
+#onboard-card {
+    border: round #00d4ff; background: #0f1117; padding: 1 2; height: auto;
+}
+#onboard-ghost { color: #8b5cf6; text-align: center; }
+#onboard-title { color: #00d4ff; text-style: bold; }
+#onboard-body { color: #c9d1d9; padding: 1 0; }
+#onboard-hint { color: #475569; }
+.check-ok { color: #22c55e; }
+.check-bad { color: #fbbf24; }
+
+/* ── modal dialogs ── */
+#rename-dialog, #help-dialog {
+    align: center middle; border: round #00d4ff; background: #0f1117;
+    padding: 1 2; width: 70; max-width: 90%;
+}
+#rename-title, #help-title { color: #00d4ff; text-style: bold; }
+#rename-input { border: round #1f2430; background: #0b0d16; color: #e2e8f0; }
+#rename-input:focus { border: round #00d4ff; }
+#help-body { color: #c9d1d9; }
+#dialog-hint { color: #475569; }
