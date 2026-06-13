@@ -15,7 +15,7 @@ from textual.widgets import Input, Label, Static
 
 from spectrida import voice
 from spectrida.core.backend import Backend
-from spectrida.tui.screens.dialogs import HelpScreen, RenameDialog
+from spectrida.tui.screens.dialogs import HelpScreen, OverviewScreen, RenameDialog
 from spectrida.tui.widgets.disasm import DisasmPane, is_sub
 from spectrida.tui.widgets.funclist import FuncList
 from spectrida.tui.widgets.statusbar import StatusBar
@@ -28,6 +28,7 @@ class BrowserScreen(Screen):
         Binding("d", "decompile_func", "Decompile"),
         Binding("c", "chain_func", "Chain"),
         Binding("b", "batch_name", "Batch"),
+        Binding("o", "overview", "Overview"),
         Binding("slash", "focus_search", "Search"),
         Binding("question_mark", "help", "Help"),
         Binding("q", "app.quit", "Quit"),
@@ -61,9 +62,9 @@ class BrowserScreen(Screen):
                 yield DisasmPane(id="disasm-pane")
                 yield Static("  MODEL", id="model-header")
                 with Vertical(id="model-pane"):
-                    yield Static("Press [b cyan]N[/] to name this function.", id="model-hint", markup=True)
+                    yield Static("Press [b cyan]N[/] to name this function.", id="model-hint")
                     yield Static("", id="model-spinner")
-                    yield Static("", id="model-result", markup=True)
+                    yield Static("", id="model-result")
                     yield Static("", id="model-reason")
         yield StatusBar()
 
@@ -86,12 +87,13 @@ class BrowserScreen(Screen):
             self.query_one("#header-status", Static).update(f" ✗ {e}")
             self.query_one("#func-count", Label).update(f"  ✗ {voice.quip('error')} — {e}")
             return
-        self.query_one("#func-list", FuncList).set_functions(funcs)
+        fl = self.query_one("#func-list", FuncList)
+        fl.set_functions(funcs)
+        fl.focus()  # focus immediately so keyboard works as soon as list appears
         named = sum(1 for f in funcs if not is_sub(f["name"]))
         self.query_one("#func-count", Label).update(f"  {len(funcs):,} funcs · {named:,} named")
         self.query_one("#header-status", Static).update(f" ●  {len(funcs):,} funcs")
         self.query_one(StatusBar).set_info(f"{self._b.title} · {len(funcs):,} functions")
-        self.query_one("#func-list", FuncList).focus()
 
     # ── search ──
     @on(Input.Changed, "#func-search")
@@ -160,36 +162,49 @@ class BrowserScreen(Screen):
 
     # ── AI naming ──
     def action_name_func(self) -> None:
-        if not self._cur or self._busy:
+        if not self._cur:
+            self.notify("select a function first", severity="warning")
             return
+        if self._busy:
+            self.notify("still naming — wait a moment", severity="warning")
+            return
+        self._busy = True
         self._spawn(self._stream_name())
 
     async def _stream_name(self) -> None:
-        self._busy = True
-        hint = self.query_one("#model-hint", Static)
-        spin = self.query_one("#model-spinner", Static)
-        res = self.query_one("#model-result", Static)
-        rsn = self.query_one("#model-reason", Static)
-        hint.update("")
-        spin.update("  ▸ thinking…")
-        res.update("")
-        rsn.update("")
         try:
+            hint = self.query_one("#model-hint", Static)
+            spin = self.query_one("#model-spinner", Static)
+            res  = self.query_one("#model-result", Static)
+            rsn  = self.query_one("#model-reason", Static)
+            hint.update("")
+            spin.update("  ▸ thinking…")
+            res.update("")
+            rsn.update("")
             full = ""
-            async for tok in self._b.stream_name(self._cur["start"], self._insns, self._callees, self._callers):
+            async for tok in self._b.stream_name(
+                    self._cur["start"], self._insns, self._callees, self._callers):
                 full += tok
                 if "REASON:" in full:
-                    name, _, reason = full.partition("REASON:")
-                    res.update(f"  ► [b green]{name.replace('NAME:', '').strip()}[/]", markup=True)
-                    rsn.update(f"\n  {reason.strip()}")
+                    name_part, _, reason_part = full.partition("REASON:")
+                    res.update(
+                        f"  ► [b green]{name_part.replace('NAME:', '').strip()}[/]")
+                    rsn.update(f"\n  {reason_part.strip()}")
                 elif "NAME:" in full:
-                    res.update(f"  ► [b green]{full.replace('NAME:', '').strip()}[/]", markup=True)
+                    res.update(
+                        f"  ► [b green]{full.replace('NAME:', '').strip()}[/]")
             spin.update("")
             from spectrida.core.ollama import extract_name
             self._suggested = extract_name(full)
+            if full and not self._suggested:
+                res.update(f"  [dim]{full[:300]}[/]")
         except Exception as e:
-            spin.update("")
-            res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]", markup=True)
+            try:
+                self.query_one("#model-spinner", Static).update("")
+                self.query_one("#model-result", Static).update(
+                    f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
+            except Exception:
+                self.notify(str(e), severity="error")
         finally:
             self._busy = False
 
@@ -236,12 +251,29 @@ class BrowserScreen(Screen):
                 if name:
                     await self._b.rename(f["start"], name)
                     f["name"] = name
-                res.update(f"  [green]{i}/{len(targets)}[/] named", markup=True)
+                res.update(f"  [green]{i}/{len(targets)}[/] named")
             self.query_one("#model-spinner", Static).update("")
             rsn.update(f"\n  {voice.quip('naming_done')}")
             self.query_one("#func-list", FuncList).set_functions(await self._b.list_functions())
         finally:
             self._busy = False
+
+    async def _do_overview(self) -> None:
+        from spectrida.api import IDADatabase
+        screen = OverviewScreen("  asking the ghost…")
+        self.app.push_screen(screen)
+        try:
+            db = IDADatabase(self._b)
+            full = ""
+            it = await db.overview(stream=True)
+            async for tok in it:
+                full += tok
+                screen.update(full)
+        except Exception as e:
+            screen.update(f"  [red]overview failed:[/] {e}")
+
+    def action_overview(self) -> None:
+        self._spawn(self._do_overview())
 
     def action_help(self) -> None:
         self.app.push_screen(HelpScreen())

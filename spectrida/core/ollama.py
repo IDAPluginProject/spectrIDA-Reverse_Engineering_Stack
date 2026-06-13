@@ -54,6 +54,8 @@ async def stream_name(
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("error"):
+                    raise RuntimeError(chunk["error"])
                 if chunk.get("response"):
                     yield chunk["response"]
                 if chunk.get("done"):

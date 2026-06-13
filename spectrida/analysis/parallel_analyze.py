@@ -193,7 +193,7 @@ def run_shard(binary: str, shard_start: int, shard_end: int, result_path: str) -
 # Open binary fresh, apply all function definitions + names from shard JSONs,
 # then run a final auto_wait() to stitch xrefs across shard boundaries.
 
-MERGE_LOADER = """
+MERGE_LOADER = """# -*- coding: utf-8 -*-
 import sys, json
 sys.path.insert(0, __import__("os").environ.get("SPECTRIDA_IDALIB") or r"C:\\Program Files\\IDA Professional 9.1")
 import idapro
@@ -227,7 +227,11 @@ for path in shard_jsons:
             idc.set_name(ea, name, 0x800)  # 0x800 = SN_FORCE (renamed in IDA 9.x)
         applied += 1
 
-print(f"[merge] applied {applied} functions, saving...", flush=True)
+print(f"[merge] applied {applied} functions, flushing analysis queue...", flush=True)
+# Flush pending analysis before saving: uncommitted add_func calls produce
+# an inconsistent database state that triggers CRC failure on reload.
+idaapi.auto_wait()
+print(f"[merge] auto_wait done, saving...", flush=True)
 
 import os, pathlib
 out_dir = pathlib.Path(os.environ.get("SPECTRIDA_OUTPUT_DIR") or r"C:\\Projects\\parallel_ida\\output")
@@ -243,7 +247,7 @@ print(f"[merge] save path: {out}", flush=True)
 
 saved = False
 try:
-    idc.save_database(out, 1)  # 1 = DBFL_TEMP: save a copy, don't change internal db path
+    idc.save_database(out, 0)  # full save (DBFL_TEMP caused corrupt .i64 on reload)
     print(f"[merge] saved (idc.save_database) -> {out}", flush=True)
     saved = True
 except BaseException as e:
@@ -251,7 +255,7 @@ except BaseException as e:
 
 if not saved:
     try:
-        idaapi.save_database(out, 1)
+        idaapi.save_database(out, 0)
         print(f"[merge] saved (idaapi.save_database) -> {out}", flush=True)
         saved = True
     except BaseException as e:
@@ -276,13 +280,24 @@ else:
 
 def merge_shards(binary: str, shard_result_paths: list[str], out_path: str | None = None) -> str:
     """Merge shard JSON results into a master .i64."""
-    script_path = Path(tempfile.mktemp(suffix=".py"))
-    script_path.write_text(MERGE_LOADER)
-    args = [PYTHON, str(script_path), binary] + shard_result_paths
-    result = subprocess.run(args, capture_output=True, text=True, cwd=IDA_DIR)
-    script_path.unlink(missing_ok=True)
-    for line in (result.stdout + result.stderr).splitlines():
-        print(line, flush=True)
+    import shutil as _shutil
+    # IDA creates .id0/.id1/.id2/.nam/.til next to the input file.
+    # If binary is in a write-protected dir (e.g. C:\Windows\System32),
+    # those files can't be created and the packed .i64 comes out corrupt.
+    # Fix: copy the binary to a writable temp dir before opening it.
+    merge_tmpdir = tempfile.mkdtemp(prefix="spectrida_merge_")
+    try:
+        tmp_binary = str(Path(merge_tmpdir) / Path(binary).name)
+        _shutil.copy2(binary, tmp_binary)
+        script_path = Path(tempfile.mktemp(suffix=".py"))
+        script_path.write_text(MERGE_LOADER, encoding="utf-8")
+        args = [PYTHON, str(script_path), tmp_binary] + shard_result_paths
+        result = subprocess.run(args, capture_output=True, text=True, cwd=IDA_DIR)
+        script_path.unlink(missing_ok=True)
+        for line in (result.stdout + result.stderr).splitlines():
+            print(line, flush=True)
+    finally:
+        _shutil.rmtree(merge_tmpdir, ignore_errors=True)
     return out_path or (binary + "_parallel.i64")
 
 
@@ -501,12 +516,21 @@ def main():
     parallel_wall = time.time() - t_wall
     print(f"\n[parallel_analyze] parallel phase done: {total_funcs} funcs in {parallel_wall:.1f}s wall")
 
-    # Step 4: Merge — clean up any stale legacy IDA database files first so
-    # IDA creates a fresh packed .i64 (not reuse old .id0/.id1 format).
+    # Step 4: Merge — clean up any stale IDA sidecar files from the output
+    # directory before merging. Sidecars accumulate from previous failed/partial
+    # open_database calls and cause rc=4 (IOPEN_BADCRC) on the next load.
     binary_stem_str = str(Path(binary).with_suffix(""))
     for _ext in (".id0", ".id1", ".id2", ".nam", ".til"):
         Path(binary_stem_str + _ext).unlink(missing_ok=True)
         Path(binary + _ext).unlink(missing_ok=True)
+
+    # Also clean sidecars next to the planned output .i64.
+    # MERGE_LOADER writes to SPECTRIDA_OUTPUT_DIR/<stem>_parallel.i64 — match that.
+    _out_dir = Path(os.environ.get("SPECTRIDA_OUTPUT_DIR") or r"C:\Projects\parallel_ida\output")
+    _out_stem = Path(binary).stem + "_parallel"
+    for _ext in (".id0", ".id1", ".id2", ".nam", ".til"):
+        (_out_dir / (_out_stem + _ext)).unlink(missing_ok=True)
+
     print("[parallel_analyze] merging shards...")
     t_merge = time.time()
     merge_shards(binary, result_paths, out)
@@ -520,10 +544,16 @@ def main():
     for p in result_paths:
         Path(p).unlink(missing_ok=True)
     shutil.rmtree(tmpdir, ignore_errors=True)
-    # Clean up discovery-pass sidecar files left next to the original binary
+    # Clean up sidecar files next to the original binary
     binary_stem = Path(binary).with_suffix("")
     for ext in (".id0", ".id1", ".nam", ".til", ".id2"):
         Path(str(binary_stem) + ext).unlink(missing_ok=True)
+    # Clean up sidecar files next to the output .i64 (IDA leaves them after save;
+    # their presence causes IOPEN_BADCRC on subsequent open_database calls).
+    _out_dir = Path(os.environ.get("SPECTRIDA_OUTPUT_DIR") or r"C:\Projects\parallel_ida\output")
+    _out_stem = Path(binary).stem + "_parallel"
+    for ext in (".id0", ".id1", ".id2", ".nam", ".til"):
+        (_out_dir / (_out_stem + ext)).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

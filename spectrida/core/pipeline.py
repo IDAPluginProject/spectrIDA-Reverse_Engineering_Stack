@@ -43,18 +43,15 @@ async def run_analysis(
     if not idalib_dir():
         return {"error": "idalib not configured — run: spectrida onboard"}
 
-    cmd = [sys.executable, str(script), binary, "--workers", str(workers or pipeline_workers())]
+    cmd = [sys.executable, "-u", str(script), binary, "--workers", str(workers or pipeline_workers())]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         cwd=str(script.parent), env=_subprocess_env(),
     )
 
-    result: dict = {}
-    assert proc.stdout
-    async for raw in proc.stdout:
-        line = raw.decode("utf-8", errors="replace").strip()
+    async def _emit(line: str) -> None:
         if not line:
-            continue
+            return
         if on_line:
             await on_line(line)
         if (m := _SAVED_RE.search(line)):
@@ -62,6 +59,28 @@ async def run_analysis(
         if (m := _TOTAL_RE.search(line)):
             result["elapsed"] = float(m.group(1))
             result["funcs"] = int(m.group(2).replace(",", ""))
+
+    result: dict = {}
+    assert proc.stdout
+    buf = b""
+    while True:
+        chunk = await proc.stdout.read(4096)
+        if not chunk:
+            break
+        buf += chunk
+        # split on \r\n, \n, or \r — pick whichever comes first
+        while True:
+            crlf = buf.find(b"\r\n")
+            lf   = buf.find(b"\n")
+            cr   = buf.find(b"\r")
+            candidates = [(i, s) for i, s in [(crlf, b"\r\n"), (lf, b"\n"), (cr, b"\r")] if i >= 0]
+            if not candidates:
+                break
+            pos, sep = min(candidates, key=lambda x: x[0])
+            await _emit(buf[:pos].decode("utf-8", errors="replace").strip())
+            buf = buf[pos + len(sep):]
+    if buf.strip():
+        await _emit(buf.decode("utf-8", errors="replace").strip())
 
     await proc.wait()
     if proc.returncode != 0 and "i64" not in result:

@@ -40,6 +40,7 @@ class HelpScreen(ModalScreen[None]):
         ("D", "toggle decompiled pseudocode"),
         ("C", "call chain — callers / callees"),
         ("B", "batch-name selected sub_ functions"),
+        ("O", "overview — AI summary of the whole binary"),
         ("/", "fuzzy search"),
         ("ctrl+p", "command palette"),
         ("Q", "quit"),
@@ -49,6 +50,25 @@ class HelpScreen(ModalScreen[None]):
         with Vertical(id="help-dialog"):
             yield Label(" ?  spectrIDA — keys", id="help-title")
             body = "\n".join(f"  [b cyan]{k:<7}[/]  {d}" for k, d in self._KEYS)
-            yield Static(body, id="help-body", markup=True)
-            yield Static(f"\n  [dim]{voice.quip('idle')}[/]", markup=True)
+            yield Static(body, id="help-body")
+            yield Static(f"\n  [dim]{voice.quip('idle')}[/]")
             yield Label("esc / ? to close", id="dialog-hint")
+
+
+class OverviewScreen(ModalScreen[None]):
+    """Streams the AI binary overview into a scrollable overlay."""
+    BINDINGS = [Binding("escape,o,q", "dismiss", "close")]
+
+    def __init__(self, text: str = ""):
+        super().__init__()
+        self._text = text
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-dialog"):
+            yield Label(" ◈  binary overview", id="help-title")
+            yield Static(self._text or "  analyzing…", id="help-body")
+            yield Label("esc to close", id="dialog-hint")
+
+    def update(self, text: str) -> None:
+        self.query_one("#help-body", Static).update(text)
+

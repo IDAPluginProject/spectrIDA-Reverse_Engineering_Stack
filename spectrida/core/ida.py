@@ -20,11 +20,15 @@ _WORKER = r"""
 import sys, json
 sys.path.insert(0, sys.argv[1])
 import idapro
-idapro.open_database(sys.argv[2], False)
-import idautils, idc, idaapi, ida_funcs
 
 def emit(obj):
     sys.stdout.write("@@RESP " + json.dumps(obj) + "\n"); sys.stdout.flush()
+
+rc = idapro.open_database(sys.argv[2], False)
+if rc != 0:
+    emit({"ok": False, "result": f"open_database failed rc={rc}"})
+    sys.exit(1)
+import idautils, idc, idaapi, ida_funcs
 
 def _norm(a):
     return int(a, 16) if isinstance(a, str) and a.startswith("0x") else int(a)
@@ -132,14 +136,18 @@ class IDAHandle:
                 pass
 
 
+_STREAM_LIMIT = 128 * 1024 * 1024  # 128 MB — list of 150k funcs is ~12 MB as JSON
+
+
 async def open_ida(i64_path: str) -> IDAHandle:
     ida = idalib_dir()
     if not ida:
-        raise RuntimeError("idalib not configured — run: spectrida onboard")
+        raise RuntimeError("idalib not configured - run: spectrida onboard")
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", _WORKER, str(Path(ida).resolve()), i64_path,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL, env=_idalib_env(),
+        limit=_STREAM_LIMIT,
     )
     handle = IDAHandle(proc, i64_path)
     ready = await handle._readresp()   # waits for the "ready" @@RESP

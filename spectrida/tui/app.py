@@ -5,8 +5,8 @@ from textual.app import App
 
 
 def _patch_textual_unmount_bug() -> None:
-    # Textual 8.x raises AttributeError from Widget._on_unmount on some teardown
-    # paths. Swallow it so quitting is always clean.
+    # Textual 8.x raises AttributeError on teardown in two places:
+    # 1. Widget._on_unmount  2. App.workers being None at cancel_all()
     try:
         from textual import widget as _w
         _orig = _w.Widget._on_unmount
@@ -17,6 +17,24 @@ def _patch_textual_unmount_bug() -> None:
             except AttributeError:
                 pass
         _w.Widget._on_unmount = _safe
+    except Exception:
+        pass
+
+    try:
+        from textual.app import App as _App
+
+        class _NullWorkers:
+            def cancel_all(self): pass
+
+        _orig_prop = _App.__dict__.get("workers")
+        if _orig_prop and hasattr(_orig_prop, "fget"):
+            _orig_fget = _orig_prop.fget
+
+            def _safe_workers(self):
+                result = _orig_fget(self)
+                return result if result is not None else _NullWorkers()
+
+            _App.workers = property(_safe_workers)
     except Exception:
         pass
 

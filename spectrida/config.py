@@ -33,7 +33,11 @@ def _load() -> dict:
         return {k: dict(v) for k, v in _DEFAULT.items()}
     try:
         with open(CONFIG_FILE, "rb") as f:
-            user = tomllib.load(f)
+            raw = f.read()
+        # strip BOM if present (written by some Windows editors)
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        user = tomllib.loads(raw.decode("utf-8", errors="replace"))
         result = {k: dict(v) for k, v in _DEFAULT.items()}
         for section, values in user.items():
             if isinstance(result.get(section), dict) and isinstance(values, dict):
@@ -104,11 +108,29 @@ def set_onboarded() -> None:
 
 # ── starter config ──────────────────────────────────────────────────────────
 
+def write_config(idalib: str = "", model: str = "spectrida-re") -> Path:
+    """Write config.toml with concrete values (used by onboarding auto-setup)."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ida_line = (f'idalib = "{Path(idalib).as_posix()}"\n' if idalib
+                else '# idalib = "C:/Program Files/IDA Professional 9.1"\n')
+    CONFIG_FILE.write_text(
+        "# spectrIDA configuration - https://github.com/ggfuchsi-oss/spectrIDA\n\n"
+        f"[ida]\n{ida_line}"
+        f'output_dir = "{output_dir().as_posix()}"\n\n'
+        "[ollama]\n"
+        'base_url = "http://localhost:11434"\n'
+        f'model = "{model}"\n\n'
+        "[pipeline]\nworkers = 16\n",
+        encoding="utf-8",
+    )
+    return CONFIG_FILE
+
+
 def write_default_config() -> Path:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         CONFIG_FILE.write_text(
-            "# spectrIDA configuration — https://github.com/ggfuchsi-oss/spectrIDA\n\n"
+            "# spectrIDA configuration - https://github.com/ggfuchsi-oss/spectrIDA\n\n"
             "[ida]\n"
             '# Path to the IDA install dir containing idalib.dll / libidalib.so\n'
             '# idalib = "C:/Program Files/IDA Professional 9.1"\n'
@@ -118,6 +140,7 @@ def write_default_config() -> Path:
             "# run: ollama pull hf.co/gdfhhjk/spectrida-re-gguf\n"
             'model = "spectrida-re"\n\n'
             "[pipeline]\n"
-            "workers = 16\n"
+            "workers = 16\n",
+            encoding="utf-8",
         )
     return CONFIG_FILE

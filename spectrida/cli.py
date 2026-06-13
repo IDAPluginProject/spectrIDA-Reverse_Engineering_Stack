@@ -60,6 +60,63 @@ def onboard():
 
 
 @app.command()
+def export(
+    i64:        str = typer.Argument(..., help="Path to .i64 database."),
+    output:     str = typer.Option(None, "-o", "--output", help="Output file (default: <stem>.<fmt>)."),
+    fmt:        str = typer.Option("json", "-f", "--format", help="json | csv | idc | symbols"),
+    named_only: bool = typer.Option(False, "--named-only", help="Skip sub_* functions."),
+):
+    """Export all function names + addresses to a file."""
+    import asyncio
+    from spectrida.api import open_i64, loading_line
+
+    p = Path(i64).expanduser()
+    if not p.exists():
+        typer.echo(f"error: not found: {p}", err=True); raise typer.Exit(1)
+
+    out = Path(output) if output else p.with_suffix(f".{fmt}")
+    typer.echo(loading_line())
+
+    async def _run():
+        async with open_i64(str(p)) as db:
+            result = await db.export(out, fmt=fmt, named_only=named_only)
+            funcs = await db.list_functions()
+            n = len(funcs) if not named_only else sum(
+                1 for f in funcs if not f["name"].lower().startswith("sub_"))
+            typer.echo(f"exported {n:,} functions -> {result}")
+
+    asyncio.run(_run())
+
+
+@app.command()
+def overview(
+    i64:     str = typer.Argument(..., help="Path to .i64 database."),
+    extra:   list[str] = typer.Option([], "-a", "--addr",
+                 help="Extra function addresses to include (hex, repeatable)."),
+    sample:  int = typer.Option(120, "-n", "--sample", help="Number of functions to sample."),
+):
+    """Ask the AI to describe what this binary does."""
+    import asyncio
+    from spectrida.api import open_i64, loading_line
+
+    p = Path(i64).expanduser()
+    if not p.exists():
+        typer.echo(f"error: not found: {p}", err=True); raise typer.Exit(1)
+
+    addrs = [int(a, 16) if a.startswith("0x") else int(a, 16) for a in extra]
+    typer.echo(loading_line())
+
+    async def _run():
+        async with open_i64(str(p)) as db:
+            it = await db.overview(sample_size=sample, extra_addresses=addrs or None, stream=True)
+            async for tok in it:
+                typer.echo(tok, nl=False)
+        typer.echo()
+
+    asyncio.run(_run())
+
+
+@app.command()
 def serve():
     """Check Ollama + the model are ready."""
     import asyncio

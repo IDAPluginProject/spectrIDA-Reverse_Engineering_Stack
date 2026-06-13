@@ -1,7 +1,12 @@
-"""First-run setup — a text flow (rich console, no TUI). Has jokes. Skippable forever."""
+"""First-run setup — a text flow (rich console, no TUI). Auto-detects IDA, can pull
+the model. Has jokes. Skippable forever."""
 from __future__ import annotations
 
 import asyncio
+import glob
+import os
+import subprocess
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -15,49 +20,97 @@ _GHOST = r"""[magenta]
        | O |
        '~~~'[/]"""
 
+_MODEL = "hf.co/gdfhhjk/spectrida-re-gguf"
+
+
+def _detect_ida() -> str:
+    """Find an IDA install with idalib, so we can wire it up automatically."""
+    roots = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+             "/opt", "/Applications", str(Path.home())]
+    cands: list[str] = []
+    for r in roots:
+        if not r:
+            continue
+        for pat in ("IDA Professional*", "IDA Pro*", "IDA*", "ida-*"):
+            cands += glob.glob(os.path.join(r, pat))
+    for c in sorted(set(cands), reverse=True):
+        if services.idalib_ok(c):
+            return c
+    return ""
+
 
 def run_onboarding(force: bool = False) -> None:
     if config.onboarded() and not force:
         return
     c = Console()
+    w = min(c.width - 4, 88)  # leave 2-char margin each side, cap at 88
     c.print(_GHOST)
-    c.print(Panel.fit(
+    c.print(Panel(
         "[b cyan]hey. i'm the ghost.[/]\n\n"
-        "I name functions while you get coffee. I shard binaries so IDA doesn't take an\n"
-        "eight-minute nap. I'm not Ghidra — never claimed to be — but the thing I do, I do\n"
+        "I name functions while you get coffee. I shard binaries so IDA doesn't take an "
+        "eight-minute nap. I'm not Ghidra — never claimed to be — but the thing I do, I do "
         "[b]fast[/], and I'll be honest when I'm guessing.\n\n"
-        "Quick setup. 20 seconds. [dim](you can ignore all of this — demo mode needs none of it.)[/]",
-        border_style="cyan"))
-
-    async def checks() -> list[str]:
-        out = ["[green]✓[/]  Python — you're running me, so, yeah."]
-        if config.idalib_dir() and services.idalib_ok():
-            out.append("[green]✓[/]  IDA / idalib — found it. nice.")
-        else:
-            out.append("[yellow]•[/]  IDA / idalib — not set. Put your IDA path in "
-                       "[b]~/.spectrida/config.toml[/] under [b][ida] idalib[/]. "
-                       "[dim](demo works without it.)[/]")
-        if not services.ollama_installed():
-            out.append(f"[yellow]•[/]  Ollama — not installed:  [b]{services.ollama_install_hint()}[/]")
-        elif not await services.ollama_running():
-            out.append("[yellow]•[/]  Ollama — installed but napping. Run [b]ollama serve[/].")
-        else:
-            out.append("[green]✓[/]  Ollama — up and awake.")
-            if await services.model_present():
-                out.append("[green]✓[/]  the model — pulled and ready. you absolute professional.")
-            else:
-                out.append("[yellow]•[/]  the model:  [b]ollama pull hf.co/gdfhhjk/spectrida-re-gguf[/] "
-                           "[dim](8.7 GB, worth it)[/]")
-        return out
+        "Quick setup. I'll do what I can automatically. [dim](demo mode needs none of it.)[/]",
+        border_style="cyan", width=w))
 
     c.print("\n[b]checking your setup…[/]")
-    for line in asyncio.run(checks()):
-        c.print("  " + line)
+    c.print("  [green]✓[/]  Python — you're running me, so, yeah.")
 
-    config.write_default_config()
+    # ── IDA: auto-detect + wire up ──
+    ida = config.idalib_dir()
+    if ida and services.idalib_ok(ida):
+        c.print(f"  [green]✓[/]  IDA / idalib — already configured ([dim]{ida}[/]).")
+    else:
+        found = _detect_ida()
+        if found:
+            ida = found
+            c.print(f"  [green]✓[/]  IDA / idalib — [b]found and wired it up[/]: [dim]{found}[/]")
+        else:
+            c.print("  [yellow]•[/]  IDA / idalib — couldn't find it. Put the path in "
+                    "[b]~/.spectrida/config.toml[/] under [b][ida] idalib[/]. "
+                    "[dim](demo works without it.)[/]")
+
+    # write the config now — preserve existing model if user already configured one
+    existing_model = config.ollama_model()
+    model_to_write = existing_model if existing_model and existing_model != "spectrida-re" else "spectrida-re"
+    config.write_config(idalib=ida or "", model=model_to_write)
+
+    # ── Ollama + model ──
+    async def _ollama_state():
+        if not services.ollama_installed():
+            return "missing", False
+        running = await services.ollama_running() or await services.ensure_ollama()
+        if not running:
+            return "stopped", False
+        return "running", await services.model_present()
+
+    state, has_model = asyncio.run(_ollama_state())
+    if state == "missing":
+        c.print(f"  [yellow]•[/]  Ollama — not installed:  [b]{services.ollama_install_hint()}[/]")
+    elif state == "stopped":
+        c.print("  [yellow]•[/]  Ollama — couldn't start it. Run [b]ollama serve[/] yourself.")
+    else:
+        c.print("  [green]✓[/]  Ollama — up and awake.")
+        if has_model:
+            c.print("  [green]✓[/]  the model — pulled and ready. you absolute professional.")
+        else:
+            c.print(f"  [yellow]•[/]  the model — not pulled. ([dim]8.7 GB[/])")
+            try:
+                ans = input("       pull it now? [y/N] ").strip().lower()
+            except EOFError:
+                ans = "n"
+            if ans == "y":
+                c.print(f"  [cyan]pulling {_MODEL} — go get that coffee…[/]")
+                subprocess.run(["ollama", "pull", _MODEL])
+            else:
+                c.print(f"       [dim]later, then:  ollama pull {_MODEL}[/]")
+
     config.set_onboarded()
-    c.print("\n  [dim]wrote a starter config to ~/.spectrida/config.toml[/]")
-    c.print("\n  [b]Keys inside:[/] [cyan]N[/] name · [cyan]C[/] chain · [cyan]D[/] decompile · "
-            "[cyan]/[/] search · [cyan]?[/] help")
-    c.print(f"  [dim]{voice.quip('welcome')}[/]\n")
-    c.print("  [b]launching the demo — go ghost through some binaries.[/] 👻\n")
+    c.print()
+    c.print(Panel(
+        "[b]keys:[/]  [cyan]N[/] name  [cyan]R[/] rename  [cyan]C[/] chain  "
+        "[cyan]D[/] decompile  [cyan]/[/] search  [cyan]B[/] batch  [cyan]?[/] help  [cyan]Q[/] quit\n\n"
+        f"[dim]{voice.quip('welcome')}[/]\n\n"
+        "[b]launching the demo — go ghost through some binaries.[/] 👻",
+        border_style="dim cyan", width=w))

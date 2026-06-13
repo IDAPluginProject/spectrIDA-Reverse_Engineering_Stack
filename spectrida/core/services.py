@@ -50,15 +50,18 @@ async def ensure_ollama() -> bool:
     return False
 
 
-async def model_present(model: str | None = None) -> bool:
-    model = model or ollama_model()
+async def installed_models() -> list[str]:
     try:
         async with httpx.AsyncClient(timeout=3) as c:
             tags = (await c.get(f"{ollama_url()}/api/tags")).json()
-        names = [m.get("name", "") for m in tags.get("models", [])]
-        return any(model in n for n in names)
+        return [m.get("name", "") for m in tags.get("models", [])]
     except Exception:
-        return False
+        return []
+
+
+async def model_present(model: str | None = None) -> bool:
+    model = model or ollama_model()
+    return any(model in n for n in await installed_models())
 
 
 async def ensure_model_loaded() -> bool:
