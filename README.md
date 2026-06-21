@@ -35,13 +35,9 @@ exactly the right amount of sarcasm.
 
 That's Chapter 1, and it stands on its own: pure speed, no AI required if you don't want it.
 
-Chapter 2 turns the output into something that outlives the session: every name, every piece of
-pseudocode, every disassembled instruction, every call edge — written into a Neo4j graph an agent
-can actually live in. Point Claude (or [pi](https://pi.dev), or anything else that speaks MCP) at
-it and it can `search_functions`, walk `get_callers`/`get_callees`, follow a call chain N hops
-deep, read exact instruction boundaries for planning a patch, and even kick off analysis on a
-brand-new binary itself — instead of you pasting decompiler output into a chat window one
-function at a time.
+Chapter 2 turns the output into something that outlives the session — a Neo4j graph an MCP client
+(Claude, [pi](https://pi.dev), whatever speaks MCP) can actually live in, instead of you
+copy-pasting decompiler output into a chat window one function at a time:
 
 ```
 Binary  ─▶  Parallel IDA Analysis  ─▶  Demangle  ─▶  AI Naming  ─▶  Neo4j Graph  ─▶  MCP Server  ─▶  Claude
@@ -49,6 +45,9 @@ Binary  ─▶  Parallel IDA Analysis  ─▶  Demangle  ─▶  AI Naming  ─�
                                                        leftovers     forever,          rename, live)
                                                        only)         across sessions)
 ```
+
+Full rundown, including what's still on the to-do pile, is down in
+[Chapter 2](#chapter-2--the-ghost-learns-to-talk-back).
 
 It is not Ghidra. It does one annoying thing (slow analysis + naming) fast, and it's genuinely fun
 to use. **199 downloads speak for themselves.**
@@ -86,18 +85,25 @@ Numbers actually re-verified during Chapter 2 development, same hardware:
 That NSO row is the real equivalent of the old Among Us "4 hours → 67 seconds" claim, measured
 fresh this release on a 74,790-function Switch binary, no AI naming involved (demangling only —
 `populate=False`). The parallel phase (16 cores, ~55s) does the initial sharded discovery; the
-merge phase (~143s) is single-threaded by design — one IDA database, one writer — and is also
-where most of the *function count* comes from: once the binary is correctly decompressed and
-flagged AArch64, IDA's own analyzer expands the parallel pass's 28k seed functions to the full
-74,790 in one consolidated pass. Getting an honest number here surfaced (and fixed) three real
-bugs in the NSO pipeline: wrong-architecture detection (it was silently scanning AArch64 as x86),
-locally-scoped entry-point seeding that missed any call crossing a shard boundary, and a missing
-LZ4-decompression step that meant earlier NSO runs were partly scanning compressed garbage. (We
-also tried trimming the merge phase's analysis flags for speed; turned out the flags that mattered
-for timing — local-variable/stack-frame analysis — are exactly what Hex-Rays needs to decompile
-anything, so disabling them silently zeroed out pseudocode for plenty of functions. Reverted to
-only skipping FLIRT signature matching, which is genuinely unneeded here and safe to drop — worth
-~3%, not the dramatic win it first looked like.)
+merge phase (~143s) is single-threaded by design — one IDA database, one writer — so if you watch
+Task Manager during that part and see 15 cores napping, that's not a bug report, that's physics.
+
+Getting an *honest* number here was its own small horror story. The first version of NSO support
+ran clean, exited 0, and proudly returned 727 functions for a binary that has roughly 75,000 of
+them — not a crash, just spectacularly, confidently wrong, which is somehow worse. Turns out IDA
+has no native NSO loader, so the file silently loaded as plain x86 ("metapc") even though the
+Switch has been ARM64 since the box launched. Every shard ran an x86 prologue scanner against pure
+AArch64 instructions and called whatever it accidentally matched a "function." Fixing the
+architecture fixed nothing on its own, because the binary was *also* still LZ4-compressed in
+memory — so half of what got scanned was, generously, noise. And even once it was properly
+decompressed and flagged AArch64, each shard was only hunting for call targets inside its own tiny
+slice of the binary, missing every call that crossed a shard boundary — which in a binary this
+size is most of them. Three bugs, one number, and not one of them had the decency to throw an
+exception. (We also tried shaving the merge phase down by skipping IDA's stack-frame analysis —
+got a beautiful speedup and a database where Hex-Rays politely refused to decompile half of it.
+That got reverted fast. Kept the much smaller, much safer FLIRT-signature skip instead, which is
+worth a shrug-worthy ~3% and didn't break anything, which by this point felt like a personality
+trait worth keeping.)
 
 **On naming accuracy:** it's not Ghidra-grade ground truth, it's an 8B model guessing from
 pseudocode. Generic helpers/getters tend to land well; deeply game-specific logic is more of a
