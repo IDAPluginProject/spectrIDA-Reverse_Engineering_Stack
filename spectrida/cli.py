@@ -7,6 +7,9 @@ import typer
 
 app = typer.Typer(add_completion=False, help="Ghost through binaries — parallel IDA analysis + AI naming.")
 
+install_app = typer.Typer(add_completion=False, help="Wire spectrIDA's MCP server into a coding agent.")
+app.add_typer(install_app, name="install")
+
 
 @app.callback(invoke_without_command=True)
 def _root(
@@ -68,7 +71,8 @@ def export(
 ):
     """Export all function names + addresses to a file."""
     import asyncio
-    from spectrida.api import open_i64, loading_line
+
+    from spectrida.api import loading_line, open_i64
 
     p = Path(i64).expanduser()
     if not p.exists():
@@ -97,7 +101,8 @@ def overview(
 ):
     """Ask the AI to describe what this binary does."""
     import asyncio
-    from spectrida.api import open_i64, loading_line
+
+    from spectrida.api import loading_line, open_i64
 
     p = Path(i64).expanduser()
     if not p.exists():
@@ -136,6 +141,26 @@ def serve():
             typer.echo(f"✗ {ollama_model()} not pulled — ollama pull hf.co/gdfhhjk/spectrida-re-gguf", err=True)
 
     asyncio.run(_check())
+
+
+@app.command()
+def mcp():
+    """Run the MCP server so Claude (or any MCP client) can query indexed
+    binaries — search functions, walk callers/callees, pull pseudocode,
+    rename, or analyze a fresh binary. Requires the graph populated via
+    scripts/populate_graph.py and a [graph] section in config.toml."""
+    from spectrida.mcp_server import main as run_mcp
+    run_mcp()
+
+
+@install_app.command("mcp")
+def install_mcp():
+    """Register spectrIDA's MCP server with Claude Code and/or pi
+    automatically — no manual .mcp.json editing, no separate pip step for
+    mcp/neo4j. Safe to re-run; restart whichever client(s) you wire up
+    afterward (MCP config is read at their startup, not live)."""
+    from spectrida.mcp_install import install_mcp as run_install
+    run_install()
 
 
 def main() -> None:

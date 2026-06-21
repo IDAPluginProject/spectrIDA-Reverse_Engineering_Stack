@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "spectrida"
-version = "0.1.0"
+version = "0.2.0"
 description = "Ghost through binaries — parallel IDA analysis + AI function naming in your terminal"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,7 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["torch>=2.0", "numpy>=1.24"]
 dev = ["pytest>=8", "ruff>=0.6"]
+graph = ["neo4j>=5.0", "mcp>=1.0"]
 
 [project.scripts]
 spectrida = "spectrida.cli:main"

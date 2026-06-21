@@ -1,7 +1,9 @@
-"""Service checks for Ollama + idalib — used by the CLI and the onboarding wizard."""
+"""Service checks for Ollama, llama-server, Neo4j + idalib — used by the CLI,
+the onboarding wizard, and the MCP server's doctor()/start_all() tools."""
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 import sys
@@ -9,7 +11,20 @@ from pathlib import Path
 
 import httpx
 
-from spectrida.config import idalib_dir, ollama_model, ollama_url
+from spectrida.config import (
+    graph_password,
+    graph_uri,
+    graph_user,
+    idalib_dir,
+    java_home,
+    llama_exe,
+    llama_extra_args,
+    llama_model_path,
+    naming_health_url,
+    neo4j_dir,
+    ollama_model,
+    ollama_url,
+)
 
 # ── Ollama ──────────────────────────────────────────────────────────────────
 
@@ -75,6 +90,105 @@ async def ensure_model_loaded() -> bool:
         return True
     except Exception:
         return False
+
+
+# ── llama-server (AI naming) ────────────────────────────────────────────────
+
+async def llama_server_running() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=2) as c:
+            return (await c.get(naming_health_url())).status_code == 200
+    except Exception:
+        return False
+
+
+def llama_server_configured() -> bool:
+    return bool(llama_exe()) and Path(llama_exe()).exists() and bool(llama_model_path()) and Path(llama_model_path()).exists()
+
+
+async def ensure_llama_server(timeout_s: float = 120) -> bool:
+    """True if llama-server is reachable; tries to launch it (GPU model load
+    can take 30-60s+, hence the generous default timeout) if not."""
+    if await llama_server_running():
+        return True
+    if not llama_server_configured():
+        return False
+    exe = Path(llama_exe())
+    try:
+        subprocess.Popen(
+            [str(exe), "-m", llama_model_path(), *llama_extra_args()],
+            cwd=str(exe.parent), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+    except Exception:
+        return False
+    elapsed = 0.0
+    while elapsed < timeout_s:
+        await asyncio.sleep(2)
+        elapsed += 2
+        if await llama_server_running():
+            return True
+    return False
+
+
+# ── Neo4j ────────────────────────────────────────────────────────────────────
+
+async def neo4j_running() -> bool:
+    try:
+        from neo4j import GraphDatabase
+
+        def _check():
+            driver = GraphDatabase.driver(graph_uri(), auth=(graph_user(), graph_password()))
+            try:
+                driver.verify_connectivity()
+                return True
+            finally:
+                driver.close()
+
+        return await asyncio.to_thread(_check)
+    except Exception:
+        return False
+
+
+def neo4j_configured() -> bool:
+    d = neo4j_dir()
+    return bool(d) and (Path(d) / "bin" / "neo4j.bat" if sys.platform == "win32" else Path(d) / "bin" / "neo4j").exists()
+
+
+async def ensure_neo4j(timeout_s: float = 60) -> bool:
+    """True if Neo4j is reachable; tries to start it if not.
+
+    Uses `console` mode, not `start` — `start` (daemon mode) requires the
+    Windows service to be pre-installed (`neo4j windows-service install`,
+    needs admin rights), which this zip-distribution install never did.
+    `console` has no such requirement; spawning it detached (own process
+    group, no inherited stdio) makes it behave like a background daemon
+    anyway since nothing is waiting on it."""
+    if await neo4j_running():
+        return True
+    if not neo4j_configured():
+        return False
+    bat = Path(neo4j_dir()) / "bin" / ("neo4j.bat" if sys.platform == "win32" else "neo4j")
+    env = os.environ.copy()
+    if java_home():
+        env["JAVA_HOME"] = java_home()
+        env["PATH"] = str(Path(java_home()) / "bin") + os.pathsep + env.get("PATH", "")
+    try:
+        subprocess.Popen(
+            [str(bat), "console"], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+    except Exception:
+        return False
+    elapsed = 0.0
+    while elapsed < timeout_s:
+        await asyncio.sleep(2)
+        elapsed += 2
+        if await neo4j_running():
+            return True
+    return False
 
 
 # ── idalib ──────────────────────────────────────────────────────────────────

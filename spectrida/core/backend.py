@@ -27,6 +27,8 @@ class Backend:
     async def xrefs_to(self, addr) -> list[dict]: ...
     async def xrefs_from(self, addr) -> list[dict]: ...
     async def rename(self, addr, name: str) -> bool: ...
+    async def demangle(self, names: list[str]) -> dict[str, str]: ...
+    async def info(self, addr) -> dict | None: ...
     def stream_name(self, addr, insns, callees, callers) -> AsyncIterator[str]: ...
     async def close(self) -> None: ...
 
@@ -52,6 +54,8 @@ class RealBackend(Backend):
     async def xrefs_to(self, addr):  return await _ida.xrefs_to(self._ida, addr)
     async def xrefs_from(self, addr): return await _ida.xrefs_from(self._ida, addr)
     async def rename(self, addr, name): return await _ida.rename(self._ida, addr, name)
+    async def demangle(self, names): return await _ida.demangle(self._ida, names)
+    async def info(self, addr): return await _ida.info(self._ida, addr)
 
     def stream_name(self, addr, insns, callees, callers):
         return _ollama.stream_name(insns, callees, callers)
@@ -84,6 +88,12 @@ class DemoBackend(Backend):
 
     def stream_name(self, addr, insns, callees, callers):
         return _demo.stream_name(addr)
+
+    async def demangle(self, names):
+        return {}
+
+    async def info(self, addr):
+        return None
 
     async def close(self):
         return None

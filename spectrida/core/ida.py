@@ -81,6 +81,24 @@ for line in sys.stdin:
                         if tf and tf.start_ea != fn.start_ea and tf.start_ea not in seen:
                             seen[tf.start_ea] = {"address": hex(tf.start_ea), "name": idc.get_func_name(tf.start_ea)}
             emit({"ok": True, "result": list(seen.values())})
+        elif cmd == "info":
+            addr = _norm(a["address"]); fn = idaapi.get_func(addr)
+            if fn:
+                emit({"ok": True, "result": {"name": idc.get_func_name(addr), "start": fn.start_ea,
+                                              "end": fn.end_ea, "size": fn.end_ea - fn.start_ea}})
+            else:
+                emit({"ok": True, "result": None})
+        elif cmd == "demangle":
+            # IDA's own demangler auto-detects the binary's actual ABI (Itanium
+            # for GCC/Clang-built ELF/NSO, MSVC-style for Windows PE) — more
+            # robust than an external demangler that only knows one scheme.
+            names = a.get("names", []); mask = idc.get_inf_attr(idc.INF_SHORT_DN)
+            out = {}
+            for n in names:
+                d = idc.demangle_name(n, mask)
+                if d:
+                    out[n] = d
+            emit({"ok": True, "result": out})
         else:
             emit({"ok": False, "error": "unknown cmd %s" % cmd})
     except Exception as e:
@@ -193,6 +211,22 @@ async def xrefs_from(ida: IDAHandle, address: str | int) -> list[dict]:
         return await ida.call("xrefs_from", address=_hex(address))
     except Exception:
         return []
+
+async def info(ida: IDAHandle, address: str | int) -> dict | None:
+    """Live {name, start, end, size} for a function — used when the graph
+    cache only has a placeholder node (no size/pseudocode recorded yet)."""
+    try:
+        return await ida.call("info", address=_hex(address))
+    except Exception:
+        return None
+
+async def demangle(ida: IDAHandle, names: list[str]) -> dict[str, str]:
+    """Demangle a batch of names via IDA's own demangler. Returns
+    {original: demangled} — entries that weren't mangled or failed are omitted."""
+    try:
+        return await ida.call("demangle", names=names)
+    except Exception:
+        return {}
 
 
 def _hex(address: str | int) -> str:

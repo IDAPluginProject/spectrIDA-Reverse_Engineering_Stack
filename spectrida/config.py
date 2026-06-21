@@ -25,6 +25,11 @@ _DEFAULT = {
     "ida":      {"idalib": "", "output_dir": str(CONFIG_DIR / "output")},
     "ollama":   {"base_url": "http://localhost:11434", "model": "spectrida-re"},
     "pipeline": {"workers": 16},
+    "graph":    {"uri": "bolt://localhost:7687", "user": "neo4j", "password": ""},
+    "naming":   {"llama_url": "http://127.0.0.1:8090/completion",
+                 "health_url": "http://127.0.0.1:8090/health"},
+    "services": {"llama_exe": "", "llama_model": "", "llama_args": "--ctx-size 8192 --parallel 4 --cont-batching -ngl 99",
+                 "neo4j_dir": "", "java_home": ""},
 }
 
 
@@ -90,6 +95,47 @@ def pipeline_script() -> Path:
     env = os.environ.get("SPECTRIDA_PIPELINE_DIR", "")
     base = Path(env) if env else Path(__file__).parent / "analysis"
     return base / "parallel_analyze.py"
+
+
+def graph_uri() -> str:
+    return get("graph", "uri", "SPECTRIDA_GRAPH_URI") or "bolt://localhost:7687"
+
+
+def graph_user() -> str:
+    return get("graph", "user", "SPECTRIDA_GRAPH_USER") or "neo4j"
+
+
+def graph_password() -> str:
+    return get("graph", "password", "SPECTRIDA_GRAPH_PASS")
+
+
+def naming_llama_url() -> str:
+    return get("naming", "llama_url", "SPECTRIDA_LLAMA_URL") or "http://127.0.0.1:8090/completion"
+
+
+def naming_health_url() -> str:
+    return get("naming", "health_url", "SPECTRIDA_LLAMA_HEALTH_URL") or "http://127.0.0.1:8090/health"
+
+
+def llama_exe() -> str:
+    return get("services", "llama_exe", "SPECTRIDA_LLAMA_EXE")
+
+
+def llama_model_path() -> str:
+    return get("services", "llama_model", "SPECTRIDA_LLAMA_MODEL")
+
+
+def llama_extra_args() -> list[str]:
+    raw = get("services", "llama_args", "SPECTRIDA_LLAMA_ARGS") or "--ctx-size 8192 --parallel 4 --cont-batching -ngl 99"
+    return raw.split()
+
+
+def neo4j_dir() -> str:
+    return get("services", "neo4j_dir", "SPECTRIDA_NEO4J_DIR")
+
+
+def java_home() -> str:
+    return get("services", "java_home", "SPECTRIDA_JAVA_HOME")
 
 
 # ── onboarding flag ─────────────────────────────────────────────────────────

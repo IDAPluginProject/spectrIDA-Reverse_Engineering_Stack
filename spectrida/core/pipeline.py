@@ -45,13 +45,18 @@ async def run_analysis(
 
     cmd = [sys.executable, "-u", str(script), binary, "--workers", str(workers or pipeline_workers())]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        *cmd, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         cwd=str(script.parent), env=_subprocess_env(),
     )
+
+    tail: list[str] = []
 
     async def _emit(line: str) -> None:
         if not line:
             return
+        tail.append(line)
+        del tail[:-40]
         if on_line:
             await on_line(line)
         if (m := _SAVED_RE.search(line)):
@@ -61,30 +66,51 @@ async def run_analysis(
             result["funcs"] = int(m.group(2).replace(",", ""))
 
     result: dict = {}
-    assert proc.stdout
-    buf = b""
-    while True:
-        chunk = await proc.stdout.read(4096)
-        if not chunk:
-            break
-        buf += chunk
-        # split on \r\n, \n, or \r — pick whichever comes first
+    try:
+        assert proc.stdout
+        buf = b""
         while True:
-            crlf = buf.find(b"\r\n")
-            lf   = buf.find(b"\n")
-            cr   = buf.find(b"\r")
-            candidates = [(i, s) for i, s in [(crlf, b"\r\n"), (lf, b"\n"), (cr, b"\r")] if i >= 0]
-            if not candidates:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
                 break
-            pos, sep = min(candidates, key=lambda x: x[0])
-            await _emit(buf[:pos].decode("utf-8", errors="replace").strip())
-            buf = buf[pos + len(sep):]
-    if buf.strip():
-        await _emit(buf.decode("utf-8", errors="replace").strip())
+            buf += chunk
+            # split on \r\n, \n, or \r — pick whichever comes first
+            while True:
+                crlf = buf.find(b"\r\n")
+                lf   = buf.find(b"\n")
+                cr   = buf.find(b"\r")
+                candidates = [(i, s) for i, s in [(crlf, b"\r\n"), (lf, b"\n"), (cr, b"\r")] if i >= 0]
+                if not candidates:
+                    break
+                pos, sep = min(candidates, key=lambda x: x[0])
+                await _emit(buf[:pos].decode("utf-8", errors="replace").strip())
+                buf = buf[pos + len(sep):]
+        if buf.strip():
+            await _emit(buf.decode("utf-8", errors="replace").strip())
 
-    await proc.wait()
+        await proc.wait()
+    except asyncio.CancelledError:
+        # the MCP tool call was cancelled (e.g. user rejected/aborted mid-run) —
+        # without this, the analyzer subprocess (and its own shard workers)
+        # keeps running orphaned, holding IDA license seats and CPU forever.
+        if proc.returncode is None:
+            if sys.platform == "win32":
+                # parallel_analyze.py spawns its own shard_worker.py children via
+                # subprocess.run() — plain proc.kill() only kills the direct
+                # child and leaves those grandchildren running. /T kills the tree.
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill", "/PID", str(proc.pid), "/T", "/F",
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await killer.wait()
+            else:
+                proc.kill()
+            await proc.wait()
+        raise
+
     if proc.returncode != 0 and "i64" not in result:
         result["error"] = f"analyzer exited {proc.returncode}"
+        result["log_tail"] = tail
     return result
 
 

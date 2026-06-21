@@ -1,6 +1,6 @@
 """
 parallel_analyze.py
-Parallel IDA auto-analysis — splits a binary into N shards, runs N idalib
+Parallel IDA auto-analysis -- splits a binary into N shards, runs N idalib
 instances simultaneously, merges results into a master .i64.
 
 Usage:
@@ -30,7 +30,7 @@ MERGE_IDC = str(Path(__file__).parent / "merge_shards.idc")
 sys.path.insert(0, IDA_DIR)
 
 
-# ── Step 1: Discovery pass ─────────────────────────────────────────────────────
+# -- Step 1: Discovery pass -----------------------------------------------------
 # Open binary quickly to find code segment boundaries WITHOUT full analysis.
 # We only need to know the .text range to shard it.
 
@@ -39,6 +39,18 @@ import sys, json, struct
 
 with open(sys.argv[1], 'rb') as f:
     h = f.read(0x1000)
+
+if h[:4] == b'NSO0':
+    # Nintendo Switch NSO: fixed header, no section table. text_mem_off/size
+    # live at 0x14/0x18. IDA's NSO loader places it at a fixed synthetic base
+    # (0x7100000000) when opened standalone (no other modules loaded) -- the
+    # same base already observed in this project's analyzed NSOs.
+    NSO_BASE = 0x7100000000
+    text_mem_off, text_size = struct.unpack_from('<II', h, 0x14)
+    start = NSO_BASE + text_mem_off
+    end   = start + text_size
+    print(json.dumps({"start": start, "end": end, "size": text_size}))
+    sys.exit(0)
 
 pe_off       = struct.unpack_from('<I', h, 0x3C)[0]
 # COFF header
@@ -107,7 +119,7 @@ def _image_base(binary: str) -> int:
 
 
 def make_shard_binary(src: str, dst: str, shard_start_va: int, shard_end_va: int) -> None:
-    """Copy src → dst, zeroing raw bytes of PE sections that fall entirely outside the shard VA range."""
+    """Copy src -> dst, zeroing raw bytes of PE sections that fall entirely outside the shard VA range."""
     import shutil
     shutil.copy2(src, dst)
     base   = _image_base(src)
@@ -160,7 +172,7 @@ def discover_text_range(binary: str) -> tuple[int, int]:
     raise RuntimeError(f"Could not discover code segment.\nstdout: {result.stdout}\nstderr: {result.stderr}")
 
 
-# ── Step 2: Per-shard worker ───────────────────────────────────────────────────
+# -- Step 2: Per-shard worker ---------------------------------------------------
 
 def run_shard(binary: str, shard_start: int, shard_end: int, result_path: str) -> dict:
     """Spawn a subprocess running shard_worker.py."""
@@ -175,7 +187,7 @@ def run_shard(binary: str, shard_start: int, shard_end: int, result_path: str) -
     for line in (proc.stdout or "").splitlines():
         if line.strip():
             print(f"  {line}", flush=True)
-    # Try to read the JSON even if returncode != 0 — close_database() sometimes
+    # Try to read the JSON even if returncode != 0 -- close_database() sometimes
     # crashes idalib after successfully writing the result file.
     try:
         data = json.loads(Path(result_path).read_text())
@@ -189,7 +201,7 @@ def run_shard(binary: str, shard_start: int, shard_end: int, result_path: str) -
     return {"error": "no json + rc=0", "shard_start": shard_start, "wall_s": wall}
 
 
-# ── Step 3: Merge ──────────────────────────────────────────────────────────────
+# -- Step 3: Merge --------------------------------------------------------------
 # Open binary fresh, apply all function definitions + names from shard JSONs,
 # then run a final auto_wait() to stitch xrefs across shard boundaries.
 
@@ -301,7 +313,7 @@ def merge_shards(binary: str, shard_result_paths: list[str], out_path: str | Non
     return out_path or (binary + "_parallel.i64")
 
 
-# ── Density-balanced shard partitioning ───────────────────────────────────────
+# -- Density-balanced shard partitioning ---------------------------------------
 
 def _density_shards(binary: str, text_start: int, text_end: int,
                     n: int) -> list[tuple[int, int]]:
@@ -345,7 +357,7 @@ def _density_shards(binary: str, text_start: int, text_end: int,
 
         data = bytes(raw_bytes)
 
-        # GPU density scan — reuse the same scanner used by workers
+        # GPU density scan -- reuse the same scanner used by workers
         sys.path.insert(0, str(Path(__file__).parent))
         from ida_gpu_accel.config import GPU_ENABLED
         from ida_gpu_accel.x86_64_scanner import _gpu_scan_x86, _x86_prologues_numpy
@@ -391,7 +403,7 @@ def _density_shards(binary: str, text_start: int, text_end: int,
         return shards
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# -- Main -----------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -404,7 +416,7 @@ def main():
     n       = args.workers
     out     = args.out
 
-    # Print accel config (import is best-effort — may not have torch)
+    # Print accel config (import is best-effort -- may not have torch)
     try:
         sys.path.insert(0, str(Path(__file__).parent))
         from ida_gpu_accel import status as accel_status
@@ -426,9 +438,25 @@ def main():
     for ext in (".id0", ".id1", ".nam", ".til", ".id2"):
         Path(str(binary_stem) + ext).unlink(missing_ok=True)
 
-    # Step 2: GPU prologue scan → density-balanced shards
-    print("[parallel_analyze] scanning function density for balanced shards...", flush=True)
-    shards = _density_shards(binary, text_start, text_end, n)
+    is_nso = Path(binary).read_bytes()[:4] == b"NSO0"
+
+    # Step 2: GPU prologue scan -> density-balanced shards
+    # NSO sections can be LZ4-compressed in the file, so the raw-file-offset
+    # GPU density prescan below -- which reads file bytes directly assuming
+    # an uncompressed, directly-mapped PE layout -- doesn't apply. We still
+    # get real parallelism though: each worker gets its own full (unzeroed,
+    # unmodified) copy and shard_worker.py restricts ITS scan to its slice of
+    # [text_start, text_end) via ida_bytes, post-load/post-decompression
+    # through idalib -- that part is already format-agnostic. Equal-width
+    # split instead of density-balanced (no raw-byte prescan available).
+    if is_nso:
+        step = max(1, (text_end - text_start) // n)
+        shards = [(s, min(s + step, text_end)) for s in range(text_start, text_end, step)]
+        print(f"[parallel_analyze] NSO detected -- {len(shards)} equal-width shards "
+              f"(no density prescan; idalib's own loader handles decompression per worker)", flush=True)
+    else:
+        print("[parallel_analyze] scanning function density for balanced shards...", flush=True)
+        shards = _density_shards(binary, text_start, text_end, n)
     sizes  = [e - s for s, e in shards]
     print(f"[parallel_analyze] {len(shards)} shards, "
           f"min {min(sizes)//1024}KB max {max(sizes)//1024}KB "
@@ -442,12 +470,16 @@ def main():
     tmpdir = Path(tempfile.mkdtemp(prefix="parallel_ida_"))
     result_paths: list[str] = []
     worker_binaries: list[str] = []
-    print(f"[parallel_analyze] writing {len(shards)} shard binaries (zeroing out-of-shard sections)...")
+    print(f"[parallel_analyze] writing {len(shards)} shard binaries"
+          f"{'' if is_nso else ' (zeroing out-of-shard sections)'}...")
     for i, (s_start, s_end) in enumerate(shards):
         wdir = tmpdir / f"worker_{i:02d}"
         wdir.mkdir()
         dst = wdir / binary_name
-        make_shard_binary(binary, str(dst), s_start, s_end)
+        if is_nso:
+            shutil.copy2(binary, dst)   # no zeroing -- NSO has no PE section table to parse
+        else:
+            make_shard_binary(binary, str(dst), s_start, s_end)
         worker_binaries.append(str(dst))
 
     futures = []
@@ -516,7 +548,7 @@ def main():
     parallel_wall = time.time() - t_wall
     print(f"\n[parallel_analyze] parallel phase done: {total_funcs} funcs in {parallel_wall:.1f}s wall")
 
-    # Step 4: Merge — clean up any stale IDA sidecar files from the output
+    # Step 4: Merge -- clean up any stale IDA sidecar files from the output
     # directory before merging. Sidecars accumulate from previous failed/partial
     # open_database calls and cause rc=4 (IOPEN_BADCRC) on the next load.
     binary_stem_str = str(Path(binary).with_suffix(""))
@@ -525,7 +557,7 @@ def main():
         Path(binary + _ext).unlink(missing_ok=True)
 
     # Also clean sidecars next to the planned output .i64.
-    # MERGE_LOADER writes to SPECTRIDA_OUTPUT_DIR/<stem>_parallel.i64 — match that.
+    # MERGE_LOADER writes to SPECTRIDA_OUTPUT_DIR/<stem>_parallel.i64 -- match that.
     _out_dir = Path(os.environ.get("SPECTRIDA_OUTPUT_DIR") or r"C:\Projects\parallel_ida\output")
     _out_stem = Path(binary).stem + "_parallel"
     for _ext in (".id0", ".id1", ".id2", ".nam", ".til"):

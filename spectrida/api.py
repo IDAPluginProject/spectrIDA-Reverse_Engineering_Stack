@@ -103,6 +103,18 @@ class IDADatabase:
         """Functions called by the function at *address*."""
         return await self._b.xrefs_from(address)
 
+    async def demangle(self, names: list[str]) -> dict[str, str]:
+        """Demangle a batch of mangled C++ names (Itanium or MSVC, whichever
+        this binary actually uses — IDA auto-detects). Free, deterministic,
+        no AI involved. Returns {original: demangled}; non-mangled or
+        unresolvable names are simply omitted from the result."""
+        return await self._b.demangle(names)
+
+    async def info(self, address: int | str) -> dict | None:
+        """Live {name, start, end, size} for the function at *address* —
+        ground truth, not a cached graph snippet. None if no function there."""
+        return await self._b.info(address)
+
     async def rename(self, address: int | str, new_name: str) -> bool:
         """Rename the function at *address* and persist to the .i64."""
         ok = await self._b.rename(address, new_name)

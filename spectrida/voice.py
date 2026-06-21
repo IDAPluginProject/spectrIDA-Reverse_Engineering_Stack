@@ -160,6 +160,22 @@ _BUCKETS: dict[str, list[tuple[str, dict[str, list[str]]]]] = {
         }),
     ],
 
+    # ── mcp install (wiring the ghost into Claude Code / pi) ──
+    "mcp_install": [
+        ("{line}", {
+            "line": [
+                "moving into your MCP client's spare room, don't mind the boxes.",
+                "wiring myself into your terminal. no, you don't need to restart twice.",
+                "becoming a tool call. living the dream.",
+                "haunting your coding agent now too. two birds, one ghost.",
+                "this is the part where i stop being a CLI and start being a colleague.",
+                "installing myself into Claude/pi so you stop copy-pasting JSON by hand.",
+                "possessing your MCP config. it'll feel a little tingly.",
+                "i contain multitudes: TUI, library, now also a tool-use citizen.",
+            ],
+        }),
+    ],
+
     # ── idle / status bar filler ──
     "idle": [
         ("{line}", {

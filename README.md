@@ -66,6 +66,12 @@ to use. **199 downloads speak for themselves.**
   The `.idc` applies all AI-generated names back into any IDA install in one click.
 - **Programmatic API** — `from spectrida.api import open_i64`. Drive everything from scripts,
   notebooks, or Claude Code without touching the TUI.
+- **MCP server** — `spectrida install mcp` wires it straight into Claude Code and/or
+  [pi](https://pi.dev), no manual JSON editing. Claude can then search/read/chain through a
+  Neo4j-backed function graph (name, pseudocode, disassembly, callers/callees) and kick off a
+  fresh analysis on a new binary itself — `analyze_binary` runs the whole pipeline (parallel
+  analysis → demangle → AI naming → graph) from one tool call, as a background job it polls.
+  Works on PE and NSO. See [Chapter 2](#chapter-2--the-ghost-learns-to-talk-back) below.
 - **Demo mode** (`spectrida --demo`) — try the whole thing with **zero setup**. No IDA, no Ollama.
 - **A first-run wizard** — helps you install Ollama + the model, detects your IDA install
   automatically, then never asks again.
@@ -240,12 +246,51 @@ Env var overrides: `SPECTRIDA_IDALIB` · `SPECTRIDA_MODEL` · `SPECTRIDA_WORKERS
 
 ---
 
-## What's coming (chapter 2)
+## Chapter 2 — the ghost learns to talk back
+
+Chapter 1 was a faster, funnier IDA. Chapter 2 is spectrIDA as a teammate: a persistent,
+queryable knowledge graph of every function it's ever named, and an MCP server so Claude (or
+any MCP client — [pi](https://pi.dev) works too) can search and reason through it directly,
+instead of you copy-pasting decompiler output into a chat window.
+
+```bash
+spectrida install mcp
+```
+
+That's it. It registers the server with Claude Code and pi automatically (pulling in `mcp` +
+`neo4j` if a bare `pip install spectrida` skipped them), writes their config, and tells you
+which restart you owe it.
+
+**What Claude actually gets, once Neo4j is running (`spectrida` config `[graph]` section,
+or just point it at a local instance):**
+
+- `search_functions` / `get_function` / `get_callees` / `get_callers` / `trace_chain` — fast,
+  cached graph reads. `get_function` returns pseudocode **and** disassembly (exact instruction
+  boundaries and operands — the layer pseudocode can't give you, which matters the moment you
+  go from "what does this do" to "where exactly would I patch this") plus inline
+  callers/callees, so Claude decides whether to chain deeper by looking at whether a callee is
+  still `sub_*` right there in the response — no extra round trip just to find out there's
+  nothing more to see.
+- `get_full_pseudocode` / `rename_function` — live, authoritative reads/writes straight to the
+  `.i64` when the cached snippet isn't enough or a name is finally figured out.
+- `analyze_binary` — hand it a binary it's never seen (PE or NSO, parallel-sharded either way)
+  and it runs the whole pipeline — analyze → demangle (Itanium *and* MSVC) → AI-name the
+  genuinely stripped leftovers → push it all into the graph — as one background job you poll,
+  so a multi-minute run never blocks the conversation.
+- `doctor` / `start_all` — check or boot llama-server + Neo4j without leaving the chat.
+
+It's not magic — a function that's still `sub_140001234` because nobody's looked at it yet is
+still `sub_140001234`. But the graph remembers everything the model *has* figured out, forever,
+across sessions, and Claude can walk it like a colleague who already read the codebase instead
+of staring at one function at a time.
+
+**Still coming:**
 
 - **Deep context naming** — follow call trees N levels deep, feed the full chain to the model.
   A function 3 hops from `encrypt_block` should know it's in the crypto path.
 - **Deobfuscation** — TigressVM pattern detection and handler tracing
-- **MCP server** — expose spectrIDA as an MCP tool so Claude Code can call it natively
+- **Actual patching** — the disassembly is in the graph now so an agent *can* plan a byte-level
+  patch; turning "here's the exact instruction to change" into "and here's the write" is next.
 
 ---
 
