@@ -23,12 +23,12 @@ from pathlib import Path
 from spectrida.analysis.formats import FormatHandler, PreparedImage
 from spectrida.analysis.formats import detect as detect_format
 
-# Arch values a FormatHandler can report (image.arch) for which neither
-# ida_gpu_accel scanner module nor capstone_scanner.scan_shard() has any real
-# support -- "arm32" (32-bit ARM/Thumb) being the current example. Used to
-# skip those scan paths cleanly instead of silently misrouting their bytes
-# through the x86_64 or AArch64 decoder.
-_UNSUPPORTED_SCAN_ARCHES = {"arm32"}
+# Arch values a FormatHandler can report (image.arch) for which no
+# ida_gpu_accel scanner module / capstone_scanner.scan_shard() path exists.
+# Empty now that arm32 has a real scanner -- kept as a named set so the next
+# genuinely unsupported arch has an obvious place to land instead of
+# silently misrouting its bytes through the wrong decoder.
+_UNSUPPORTED_SCAN_ARCHES: set[str] = set()
 
 IDA_DIR   = os.environ.get("SPECTRIDA_IDALIB") or r"C:\Program Files\IDA Professional 9.1"
 IDAT_EXE  = str(Path(IDA_DIR) / "idat.exe")
@@ -195,6 +195,17 @@ for path in shard_jsons:
         ea   = fn["ea"]
         name = fn.get("name", "")
         size = fn.get("size", 0)
+        # arm32 only: the scanner found this function in Thumb mode. IDA
+        # decodes a region as ARM by default for a raw-loaded image with no
+        # native loader (same gap as the NSO/post_open() comment above) --
+        # without setting the T register first, add_func() defines the
+        # right bytes at the right address but IDA disassembles them as ARM,
+        # producing garbage instructions instead of the real Thumb code.
+        if fn.get("thumb"):
+            try:
+                idc.split_sreg_range(ea, "T", 1, idc.SR_user)
+            except Exception as _e:
+                print(f"[merge] split_sreg_range(T) failed at {ea:#x}: {_e}", flush=True)
         # Create function boundary if IDA doesn't know it yet
         if ida_funcs.get_func(ea) is None:
             if size > 0:
@@ -312,6 +323,12 @@ def _density_shards(handler: FormatHandler, image: PreparedImage, text_start: in
         if image.arch == "arm64":
             from ida_gpu_accel.arm64_scanner import scan as _arm64_scan
             hits, _, _, _ = _arm64_scan(data, text_start)
+        elif image.arch == "arm32":
+            # Prologue addresses come back mode-tagged (odd == Thumb, see
+            # arm32_scanner.py) -- harmless here, the boundary-alignment
+            # mask below (`& ~0xF`) strips the low bits anyway.
+            from ida_gpu_accel.arm32_scanner import scan as _arm32_scan
+            hits, _, _, _ = _arm32_scan(data, text_start)
         else:
             from ida_gpu_accel.config import GPU_ENABLED
             from ida_gpu_accel.x86_64_scanner import _gpu_scan_x86, _x86_prologues_numpy

@@ -21,13 +21,13 @@ import sys
 import time
 from pathlib import Path
 
-# Arch values a FormatHandler can report for which neither ida_gpu_accel
-# scanner module nor capstone_scanner.scan_shard() has any real support --
-# "arm32" (32-bit ARM/Thumb) being the current example (capstone_scanner.py
-# only builds CS_ARCH_X86 and CS_ARCH_ARM64 Capstone instances). Used below
-# to skip those scan paths cleanly instead of silently misrouting 32-bit ARM
-# bytes through the x86_64 or AArch64 decoder.
-_UNSUPPORTED_SCAN_ARCHES = {"arm32"}
+# Arch values a FormatHandler can report for which no ida_gpu_accel scanner
+# module / capstone_scanner.scan_shard() path exists. Empty now that arm32
+# has a real scanner (arm32_scanner.py + capstone_scanner._scan_shard_arm32)
+# -- kept as a named set (not removed outright) so the next genuinely
+# unsupported arch has an obvious place to land instead of silently
+# misrouting its bytes through the wrong decoder.
+_UNSUPPORTED_SCAN_ARCHES: set[str] = set()
 
 IDA_DIR   = os.environ.get("SPECTRIDA_IDALIB") or r"C:\Program Files\IDA Professional 9.1"
 ACCEL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -140,6 +140,15 @@ elif not entries_path:
                 else:
                     entry_points = _x86_prologues_numpy(raw, shard_start)
                 log(f"GPU scan: {len(entry_points)} entry points")
+        elif arch == "arm32":
+            # No GPU path -- arm32_scanner.scan() is a threaded Capstone
+            # sweep (see its module docstring for why a bitmask scanner
+            # isn't safe here: ARM/Thumb mode ambiguity).
+            from ida_gpu_accel.arm32_scanner import scan as scan_arm32
+            if raw:
+                prologues, bl_targets, _, _ = scan_arm32(raw, shard_start)
+                entry_points = sorted(set(prologues) | set(bl_targets))
+                log(f"CPU scan: {len(entry_points)} entry points")
         else:
             from ida_gpu_accel.arm64_scanner import scan
             if raw:
@@ -171,17 +180,28 @@ try:
     result = scan_shard(raw, shard_start, shard_start, shard_end, arch=arch,
                        entry_points=entry_points if entries_path else None)
 
+    # arm32 EAs are mode-tagged (odd == Thumb, see arm32_scanner.py) for the
+    # scanner/disassembler's own benefit -- IDA's add_func() needs the real,
+    # even address, but the merge step (parallel_analyze.py) still needs to
+    # know which functions were Thumb so it can mark the T register before
+    # add_func(), or IDA decodes the bytes as ARM and gets garbage. Stripping
+    # the address while keeping a separate "thumb" flag is a no-op for every
+    # other arch (x86_64/arm64 EAs are already even, thumb is always False).
     for fi in result.funcs:
-        if shard_start <= fi.ea < shard_end:
-            capstone_funcs.append({"ea": fi.ea, "name": f"sub_{fi.ea:x}", "size": getattr(fi, "size", 0), "callers": []})
+        ea = fi.ea & ~1
+        if shard_start <= ea < shard_end:
+            capstone_funcs.append({"ea": ea, "name": f"sub_{ea:x}", "size": getattr(fi, "size", 0),
+                                    "callers": [], "thumb": bool(fi.ea & 1)})
 
     log(f"Capstone: {len(capstone_funcs)} funcs found")
 
 except Exception as _exc:
     log(f"Capstone failed ({_exc}), falling back to GPU preseed only")
-    for ea in entry_points:
+    for raw_ea in entry_points:
+        ea = raw_ea & ~1
         if shard_start <= ea < shard_end:
-            capstone_funcs.append({"ea": ea, "name": f"sub_{ea:x}", "size": 0, "callers": []})
+            capstone_funcs.append({"ea": ea, "name": f"sub_{ea:x}", "size": 0,
+                                    "callers": [], "thumb": bool(raw_ea & 1)})
 
 elapsed = time.time() - t_start
 log(f"done in {elapsed:.1f}s")

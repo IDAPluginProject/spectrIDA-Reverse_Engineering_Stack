@@ -280,6 +280,140 @@ def _scan_shard_arm64(data: bytes, base_ea: int,
                        strings=strings, elapsed_s=elapsed)
 
 
+# ── ARM32 (ARM + Thumb-2) recursive descent ───────────────────────────────────
+# Entry points and callees are mode-tagged via arm32_scanner's odd-address
+# convention (is_thumb()/strip_mode()) so this can switch Capstone instances
+# (CS_MODE_ARM vs CS_MODE_THUMB) per block instead of guessing one mode for
+# the whole shard -- that per-address-not-per-shard mode tracking is the
+# entire reason this isn't just a third arch branch reusing _scan_shard_arm64.
+
+def _scan_shard_arm32(data: bytes, base_ea: int,
+                      shard_start: int, shard_end: int,
+                      entry_points: list[int]) -> ShardResult:
+    t0 = time.perf_counter()
+
+    if not HAS_CAPSTONE:
+        raise ImportError("capstone not installed — run: pip install capstone")
+
+    from capstone import arm_const
+
+    from .arm32_scanner import is_thumb, strip_mode, thumb_addr
+
+    md_arm = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM)
+    md_arm.detail = True
+    md_thumb = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
+    md_thumb.detail = True
+
+    visited: set[int] = set()       # mode-tagged entry EAs already disassembled
+    funcs: list[FuncInfo] = []
+    all_callees: set[int] = set()   # mode-tagged
+
+    def disasm_func(entry_tagged: int) -> FuncInfo | None:
+        entry = strip_mode(entry_tagged)
+        if entry_tagged in visited or entry < shard_start or entry >= shard_end:
+            return None
+        visited.add(entry_tagged)
+
+        worklist: list[int] = [entry_tagged]   # mode-tagged work items
+        seen_blocks: set[int] = set()
+        all_eas: set[int] = set()
+        callees: set[int] = set()
+        max_ea = entry
+
+        while worklist:
+            cur = worklist.pop()
+            if cur in seen_blocks:
+                continue
+            seen_blocks.add(cur)
+            cur_thumb = is_thumb(cur)
+            cur_ea = strip_mode(cur)
+            if cur_ea < shard_start or cur_ea >= shard_end:
+                continue
+            offset = cur_ea - base_ea
+            if offset < 0 or offset >= len(data):
+                continue
+
+            md = md_thumb if cur_thumb else md_arm
+            for insn in md.disasm(data[offset:offset + 512], cur_ea):
+                all_eas.add(insn.address)
+                if insn.address > max_ea:
+                    max_ea = insn.address
+
+                if insn.id in (arm_const.ARM_INS_BL, arm_const.ARM_INS_BLX):
+                    for op in insn.operands:
+                        if op.type == arm_const.ARM_OP_IMM:
+                            tgt = op.imm
+                            # BLX flips mode, BL doesn't.
+                            tgt_thumb = cur_thumb if insn.id == arm_const.ARM_INS_BL else not cur_thumb
+                            callees.add(thumb_addr(tgt) if tgt_thumb else tgt)
+                    continue
+
+                # Returns: POP {..,PC} (Thumb) / BX LR / LDM {..,PC}
+                if insn.id == arm_const.ARM_INS_POP and any(
+                    op.type == arm_const.ARM_OP_REG and op.reg == arm_const.ARM_REG_PC
+                    for op in insn.operands
+                ):
+                    break
+                if insn.id == arm_const.ARM_INS_BX and any(
+                    op.type == arm_const.ARM_OP_REG and op.reg == arm_const.ARM_REG_LR
+                    for op in insn.operands
+                ):
+                    break
+
+                if insn.group(capstone.CS_GRP_JUMP):
+                    # cc == ARM_CC_AL ("always") means this branch has no
+                    # real condition -- an unconditional B, so the fallthrough
+                    # path is unreachable and shouldn't be queued as a successor.
+                    is_cond = insn.cc != arm_const.ARM_CC_AL
+                    for op in insn.operands:
+                        if op.type == arm_const.ARM_OP_IMM:
+                            tgt = op.imm
+                            tgt_tagged = thumb_addr(tgt) if cur_thumb else tgt
+                            if shard_start <= tgt < shard_end:
+                                worklist.append(tgt_tagged)
+                            else:
+                                callees.add(tgt_tagged)
+                    if is_cond:
+                        fall = insn.address + insn.size
+                        worklist.append(thumb_addr(fall) if cur_thumb else fall)
+                    break
+
+        if not all_eas:
+            return None
+        return FuncInfo(ea=entry_tagged, size=max_ea - entry + 4, name=f"sub_{entry:x}",
+                        callees=sorted(callees), callers=[])
+
+    for ep in entry_points:
+        fi = disasm_func(ep)
+        if fi:
+            funcs.append(fi)
+            all_callees.update(fi.callees)
+
+    for tgt in list(all_callees):
+        if strip_mode(tgt) >= shard_start and strip_mode(tgt) < shard_end and tgt not in visited:
+            fi = disasm_func(tgt)
+            if fi:
+                funcs.append(fi)
+
+    callee_to_callers: dict[int, list[int]] = defaultdict(list)
+    for fi in funcs:
+        for c in fi.callees:
+            callee_to_callers[c].append(fi.ea)
+    funcs = [FuncInfo(ea=fi.ea, size=fi.size, name=fi.name,
+                      callees=fi.callees,
+                      callers=callee_to_callers.get(fi.ea, []))
+             for fi in funcs]
+
+    from .arm64_scanner import _cpu_string_scan
+    strings = _cpu_string_scan(data, base_ea)
+
+    elapsed = time.perf_counter() - t0
+    print(f"[capstone] arm32 shard {shard_start:#x}-{shard_end:#x}: "
+          f"{len(funcs)} funcs in {elapsed:.2f}s", flush=True)
+    return ShardResult(funcs=funcs, bb_heads=sorted({fi.ea for fi in funcs}),
+                       strings=strings, elapsed_s=elapsed)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def scan_shard(data: bytes, base_ea: int,
@@ -293,14 +427,21 @@ def scan_shard(data: bytes, base_ea: int,
     per-shard scan would miss simply because the calling instruction lives in
     a different shard than its target.
 
-    arch: "x86_64" or "arm64"
+    arch: "x86_64", "arm64", or "arm32"
     """
     if entry_points is not None:
         if arch == "x86_64":
             return _scan_shard_x86(data, base_ea, shard_start, shard_end, entry_points)
+        if arch == "arm32":
+            return _scan_shard_arm32(data, base_ea, shard_start, shard_end, entry_points)
         return _scan_shard_arm64(data, base_ea, shard_start, shard_end, entry_points)
 
     # Step 1: GPU/CPU fast scan to seed entry points
+    if arch == "arm32":
+        from .arm32_scanner import scan as _arm32_scan
+        prologues, bl_targets, _, _ = _arm32_scan(data, base_ea)
+        entry_points = sorted(set(prologues) | set(bl_targets))
+        return _scan_shard_arm32(data, base_ea, shard_start, shard_end, entry_points)
     if arch == "x86_64":
         if GPU_ENABLED:
             try:

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.6 — 32-bit ARM gets a real scanner
+
+0.2.5 stopped 32-bit ARM from crashing by labeling it correctly and skipping the scan paths
+entirely -- functions still got found, just only via IDA's own (slower, less complete) native
+analysis. This adds the real thing.
+
+- **`ida_gpu_accel/arm32_scanner.py`** -- new module. Unlike the x86_64/arm64 scanners, this isn't
+  a hand-rolled GPU bitmask matcher: ARM32 code switches between two incompatible instruction
+  encodings (4-byte ARM, 2-/4-byte Thumb-2) with no per-byte tag saying which is active, and
+  guessing wrong silently decodes garbage from the wrong decoder -- precisely the bug class 0.2.5
+  fixed. A threaded Capstone linear sweep (both modes, unioned) sidesteps that by using Capstone's
+  own decoder as ground truth instead of re-deriving Thumb-2's bit-level encoding by hand. No GPU
+  path; CPU-only is fast enough at typical Android `.so` `.text` sizes.
+  - Detects function starts via `PUSH {.., LR}` / `PUSH.W {.., LR}` (bare `PUSH` without LR is a
+    mid-function register spill, not a prologue -- excluded).
+  - Detects `BL`/`BLX` call targets, correctly tracking that `BL` keeps the caller's mode while
+    `BLX` switches it.
+  - Mode is encoded with the standard ARM EABI odd-address convention (odd = Thumb) so the
+    existing `list[int]` API shape (shared with `arm64_scanner.scan()`) didn't need to change.
+- **`capstone_scanner.py`** -- new `_scan_shard_arm32()`: recursive-descent disassembly that
+  switches Capstone instances (`CS_MODE_ARM` vs `CS_MODE_THUMB`) per basic block based on each
+  work item's own mode tag, rather than assuming one mode for an entire shard. `scan_shard()` now
+  has a real `arch="arm32"` branch instead of falling into the arm64 `else`.
+- **`shard_worker.py`/`parallel_analyze.py`** -- `_UNSUPPORTED_SCAN_ARCHES` is empty again (kept as
+  a named set for the next genuinely unsupported arch, rather than removed outright). Function EAs
+  found in Thumb mode carry a `"thumb"` flag through the shard JSON; the merge step sets IDA's `T`
+  (Thumb) segment register before `add_func()` for those, or IDA would define the right address
+  range but disassemble it as ARM and decompile garbage.
+- `tests/test_arm32_scanner.py` -- prologue detection (16-bit and Thumb-2 32-bit encodings),
+  bare-PUSH exclusion, and shard scanning across two independent functions, verified against
+  Capstone's own decode output (not reimplemented bit-twiddling).
+
 ## 0.2.5 — 32-bit ARM stops pretending to be AArch64
 
 Found analyzing a real armeabi-v7a `.so`: `ELFHandler`'s arch-hint table only mapped x86_64 and
