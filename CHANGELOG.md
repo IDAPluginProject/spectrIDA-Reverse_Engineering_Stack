@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — formats become extensions
+## 0.2.4 — formats become extensions
 
 Binary-format support was three special cases wired straight into the pipeline: PE section
 parsing in `parallel_analyze.py`, and an `if is_nso` branch threaded through
