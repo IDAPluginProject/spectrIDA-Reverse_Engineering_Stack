@@ -35,6 +35,11 @@ dependencies = [
 gpu = ["torch>=2.0", "numpy>=1.24"]
 dev = ["pytest>=8", "ruff>=0.6"]
 graph = ["neo4j>=5.0", "mcp>=1.0"]
+# Dynamic analysis (Atlas): emulate / live-instrument / fuzz functions and write
+# runtime facts onto the graph. Heavy (unicorn/frida/torch) → opt-in only; the
+# base spectrIDA install pulls none of it. Enables the emulate_function /
+# hunt_crashes / live_trace / learn_vm MCP tools.
+atlas = ["phantomrt>=0.1"]
 
 [project.scripts]
 spectrida = "spectrida.cli:main"

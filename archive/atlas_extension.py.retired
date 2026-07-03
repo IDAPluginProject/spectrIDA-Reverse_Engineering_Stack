@@ -1,0 +1,237 @@
+"""
+RETIRED — superseded by spectrida/dynamic/ + the inline dynamic tools in
+mcp_server.py (emulate_function / hunt_crashes / live_trace / dynamic_overview /
+risk_functions), which all back onto spectrIDA's Neo4j graph.
+
+This module used a separate in-memory REGraph and is NO LONGER hooked into the MCP
+server. It is kept only for reference. Do not re-register it — it would create a
+second, graph-inconsistent set of Atlas tools. The imports below are left intact
+so the file still parses, but nothing imports this module anymore.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+# Add project to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from atlas.analysis.re_triangle import REGraph, get_graph
+from atlas.vm.wsl_vm import WslVM
+from atlas.environments.vm_world import VMWorldEnv
+from atlas.agents.command_space import CommandProposer
+from atlas.training.self_train import SelfTrainer
+from atlas.analysis.binary_fuzz import BinaryFuzzEnv, InputProposer, embed_input, input_family
+
+
+def register_atlas_tools(mcp):
+    """Register ATLAS tools with the MCP server."""
+    
+    @mcp.tool()
+    async def atlas_analyze_vm(steps: int = 500, device: str = "cuda") -> dict:
+        """Analyze a Linux VM with ATLAS (dynamic exploration).
+        
+        The agent explores the VM, discovers programs, finds patterns,
+        and grows its brain. Returns exploration statistics.
+        """
+        from atlas.vm.wsl_vm import WslVM
+        from atlas.environments.vm_world import VMWorldEnv
+        from atlas.agents.command_space import CommandProposer
+        from atlas.training.self_train import SelfTrainer
+        
+        vm = WslVM()
+        vm.provision()
+        
+        if not vm.health_ok():
+            return {"error": "VM unhealthy"}
+        
+        env = VMWorldEnv(vm)
+        proposer = CommandProposer(vm)
+        trainer = SelfTrainer(env, proposer, device=device)
+        
+        trainer.run(max_steps=steps, report_every=100)
+        
+        return {
+            "status": "complete",
+            "steps": steps,
+            "families": len(trainer.tracker.err),
+            "coverage": len(env.seen),
+            "recoveries": env.recoveries,
+            "params": sum(p.numel() for p in trainer.wm.parameters()),
+        }
+    
+    @mcp.tool()
+    async def atlas_fuzz_binary(
+        source: str = None,
+        steps: int = 1000,
+        device: str = "cuda"
+    ) -> dict:
+        """Fuzz a binary for crashes with ATLAS.
+        
+        Compiles the target with coverage instrumentation,
+        then uses curiosity-driven exploration to find crashes.
+        Returns crash inputs and coverage statistics.
+        """
+        from atlas.vm.wsl_vm import WslVM
+        from atlas.analysis.binary_fuzz import BinaryFuzzEnv, InputProposer
+        from atlas.training.self_train import SelfTrainer
+        
+        vm = WslVM()
+        vm.provision()
+        
+        if not vm.health_ok():
+            return {"error": "VM unhealthy"}
+        
+        env = BinaryFuzzEnv(vm, source=source)
+        proposer = InputProposer()
+        trainer = SelfTrainer(env, proposer, device=device)
+        
+        trainer.run(max_steps=steps, report_every=200)
+        
+        summary = env.summary()
+        
+        # Add to graph
+        graph = get_graph()
+        for crash_kind, input_hex in summary["crash_inputs"].items():
+            graph.add_vulnerability(
+                function="unknown",
+                vuln_type=crash_kind.split(":")[0],
+                input_hex=input_hex,
+                crash_signal=crash_kind,
+                discovered_by="atlas_fuzz"
+            )
+        
+        return {
+            "status": "complete",
+            "functions_covered": summary["functions_covered"],
+            "unique_crashes": summary["unique_crashes"],
+            "crash_inputs": summary["crash_inputs"],
+        }
+    
+    @mcp.tool()
+    async def atlas_hook_function(
+        binary_path: str,
+        function_address: str,
+        duration: int = 10
+    ) -> dict:
+        """Hook a function with Frida and trace its execution.
+        
+        Attaches Frida to the binary, hooks the specified function,
+        and captures all calls/returns for the given duration.
+        """
+        from atlas.analysis.frida_harness import FridaHarness
+        
+        harness = FridaHarness(binary_path)
+        harness.spawn_and_attach()
+        
+        address = int(function_address, 16)
+        harness.hook_function(address, f"func_{function_address}")
+        
+        harness.device.resume(harness.pid)
+        import time
+        time.sleep(duration)
+        
+        summary = harness.summary()
+        harness.stop()
+        
+        # Add to graph
+        graph = get_graph()
+        graph.add_function(
+            function_address,
+            f"func_{function_address}",
+            ai_reasoning="hooked by Frida"
+        )
+        
+        for event in summary.get("crash_details", []):
+            graph.add_vulnerability(
+                function=function_address,
+                vuln_type="dynamic_crash",
+                input_hex="",
+                crash_signal=event.get("kind", "unknown"),
+                discovered_by="atlas_frida"
+            )
+        
+        return summary
+    
+    @mcp.tool()
+    async def atlas_get_re_graph() -> dict:
+        """Get the complete reverse engineering graph.
+        
+        Returns all known information about the binary:
+        functions, vulnerabilities, call chains, risk scores.
+        """
+        graph = get_graph()
+        return {
+            "functions": len(graph.functions),
+            "vulnerabilities": len(graph.vulnerabilities),
+            "edges": len(graph.edges),
+            "context": graph.to_mcp_context(),
+        }
+    
+    @mcp.tool()
+    async def atlas_find_exploit_chains(max_depth: int = 5) -> dict:
+        """Find connected vulnerability chains in the binary.
+        
+        Returns chains of functions where exploiting one
+        leads to exploiting the next.
+        """
+        graph = get_graph()
+        chains = graph.get_exploit_chains()
+        
+        result = []
+        for chain in chains:
+            names = [graph.functions.get(a, type("F", (), {"name": "?"})()).name for a in chain]
+            result.append({
+                "addresses": chain,
+                "names": names,
+                "length": len(chain),
+            })
+        
+        return {"chains": result, "total": len(result)}
+    
+    @mcp.tool()
+    async def atlas_get_risk_functions(top_n: int = 10) -> dict:
+        """Get functions sorted by risk score (most dangerous first)."""
+        graph = get_graph()
+        risk_funcs = graph.get_risk_functions(top_n)
+        
+        return {
+            "functions": [
+                {
+                    "address": f.address,
+                    "name": f.name,
+                    "risk_score": f.risk_score,
+                    "ai_name": f.ai_name,
+                    "crash_count": len(f.crash_inputs),
+                }
+                for f in risk_funcs
+            ]
+        }
+    
+    @mcp.tool()
+    async def atlas_overview() -> dict:
+        """Get a complete overview from all analysis sources."""
+        graph = get_graph()
+        
+        overview = {
+            "total_functions": len(graph.functions),
+            "vulnerabilities": len(graph.vulnerabilities),
+            "edges": len(graph.edges),
+            "high_risk_functions": [
+                {"name": f.name, "risk": f.risk_score}
+                for f in graph.get_risk_functions(5)
+            ],
+            "vulnerability_summary": {},
+            "exploit_chains": len(graph.get_exploit_chains()),
+        }
+        
+        for v in graph.vulnerabilities:
+            vtype = v.vuln_type
+            overview["vulnerability_summary"][vtype] = (
+                overview["vulnerability_summary"].get(vtype, 0) + 1
+            )
+        
+        return overview
+    
+    print("[atlas] ATLAS tools registered with MCP server")

@@ -32,6 +32,11 @@ from spectrida.core.graph import FunctionGraph
 
 mcp = FastMCP("spectrida")
 
+# Dynamic analysis tools (emulate_function / hunt_crashes / live_trace + the
+# dyn_* graph queries below) are defined inline in this module and back onto the
+# same Neo4j graph. The older spectrida.atlas_extension (separate in-memory
+# REGraph) is retired in favor of this single, graph-consistent integration.
+
 _SHARD_PROGRESS_RE = re.compile(r"(\d+)/(\d+) shards")
 
 _graph: FunctionGraph | None = None
@@ -269,6 +274,244 @@ async def rename_function(binary: str, address: str, new_name: str) -> dict:
 
 
 @mcp.tool()
+async def emulate_function(binary: str, address: str, binary_path: str = "") -> dict:
+    """DYNAMIC analysis: actually RUN one function by CPU emulation (no OS, any
+    arch) and report what happens — the runtime complement to the static graph.
+
+    Chain-emulates the function (maps the whole image so internal calls resolve,
+    stubs out-of-chain calls) with a few fuzzed inputs, then returns an honest
+    verdict and writes it onto the graph node (dyn_* props, visible via
+    get_function):
+      - candidate_crash : faulted on a wild address → possible bug (verify the
+                          faulting pointer is input-controlled before trusting it)
+      - needs_state     : faulted on an uninitialized global/this → the function
+                          needs live engine state; emulation can't see it (reason
+                          statically, or use live instrumentation on a runnable target)
+      - exercised_clean : ran to return
+      - inconclusive    : no clean return within the instruction budget
+
+    Fast/synchronous — good for triage. Needs the ORIGINAL binary bytes; pass
+    binary_path if it isn't auto-resolved from ~/.spectrida or the Binary node.
+    Requires the optional 'atlas' extra (pip install "spectrida[atlas]")."""
+    from spectrida import dynamic
+    dynamic.require()
+    from spectrida.dynamic.emulate import emulate_one
+    from spectrida.dynamic.annotate import annotator
+
+    addr = _norm_addr(address)
+    result = await asyncio.to_thread(
+        emulate_one, _g(), binary, addr, binary_path or None)
+
+    # persist the runtime verdict onto the graph node for the next agent to read.
+    # Use `status` (→ dyn_status) as the canonical verdict field, consistent with
+    # hunt_crashes and the dynamic_overview / risk_functions queries.
+    facts = {"status": result["verdict"], "tool": "atlas-emulate"}
+    for k in ("note", "reachable", "blocks", "stubbed_calls", "arch"):
+        if result.get(k) is not None:
+            facts[k] = result[k]
+    if result.get("crash_input"):
+        facts["crash_input"] = result["crash_input"]
+    try:
+        annotator(_g()).annotate(binary, facts, addr=addr)
+        result["annotated"] = True
+    except Exception as e:
+        result["annotated"] = False
+        result["annotate_error"] = str(e)
+    return result
+
+
+@mcp.tool()
+async def hunt_crashes(binary: str, address: str, seeds_dir: str = "",
+                       binary_path: str = "", rounds: int = 400) -> dict:
+    """DYNAMIC: fuzz ONE function for crashes and record the reproducing inputs.
+
+    Emulate-fuzzes the function with many mutated inputs, seeded from `seeds_dir`
+    when provided — this is the agent↔Atlas seam: you (the agent) read the
+    function's format from its pseudocode, fetch/generate valid sample inputs
+    (e.g. real PNG/TTF/save files), drop them in a folder, and pass its path.
+    Good seeds start the fuzzer INSIDE the parser and dramatically improve reach.
+
+    Long-running → returns a job_id immediately; poll with poll_analysis(). On
+    completion, annotates each crash (dyn_crashes, dyn_crash_input) onto the graph
+    node. Requires the optional 'atlas' extra (pip install "spectrida[atlas]")."""
+    from spectrida import dynamic
+    dynamic.require()
+
+    addr = _norm_addr(address)
+    job_id = uuid.uuid4().hex[:12]
+    _jobs[job_id] = {"status": "running", "binary": binary,
+                     "progress": "queued", "created": time.time(),
+                     "result": None, "error": None}
+
+    async def _run() -> None:
+        job = _jobs[job_id]
+        try:
+            from spectrida.dynamic.fuzz import hunt
+            from spectrida.dynamic.annotate import annotator
+
+            def prog(done, total, ncrash):
+                job["progress"] = f"fuzzing {done}/{total}, {ncrash} crashes"
+
+            result = await asyncio.to_thread(
+                hunt, _g(), binary, addr, binary_path or None,
+                seeds_dir or None, rounds, 8000, prog)
+
+            facts = {"status": result["verdict"], "reachable": result["reachable"],
+                     "blocks": result["blocks"], "crashes": result["unique_crashes"],
+                     "seeds_used": result["seeds_used"], "tool": "atlas-hunt"}
+            crash_inputs = list(result["crash_inputs"].values())
+            if crash_inputs:
+                facts["crash_input"] = crash_inputs[0]
+                facts["crash_count"] = len(crash_inputs)
+            try:
+                annotator(_g()).annotate(binary, facts, addr=addr)
+                result["annotated"] = True
+            except Exception as e:
+                result["annotated"] = False
+                result["annotate_error"] = str(e)
+
+            job["result"] = result
+            job["status"] = "done"
+            job["progress"] = f"done: {result['unique_crashes']} crashes"
+        except Exception as exc:
+            import traceback
+            job["status"] = "error"
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            job["progress"] = f"failed: {traceback.format_exc()[-400:]}"
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id, "status": "started", "binary": binary,
+            "hint": f"call poll_analysis('{job_id}') — fuzzing runs for a bit"}
+
+
+@mcp.tool()
+async def learn_vm(steps: int = 500, device: str = "cpu") -> dict:
+    """RESEARCH: turn Atlas's self-directed learner loose in an isolated throwaway
+    WSL VM. It proposes and runs real commands, predicts their outcomes, learns
+    from the real results (surprise = prediction error), and grows its own capacity
+    when it hits a learnable-but-underfit wall.
+
+    Unlike the per-function tools this explores a whole VM (not one binary), so it
+    returns LEARNING statistics — prediction-error trend, held-out generalization,
+    behavior coverage, growth events, honest per-family competence — rather than
+    graph annotations. Heavy: provisions a WSL2 distro, ideally uses a GPU
+    (device='cuda'). Long-running → returns a job_id; poll with poll_analysis().
+    Requires the optional 'atlas' extra (pip install "spectrida[atlas]")."""
+    from spectrida import dynamic
+    dynamic.require()
+
+    job_id = uuid.uuid4().hex[:12]
+    _jobs[job_id] = {"status": "running", "binary": "(vm)",
+                     "progress": "provisioning VM", "created": time.time(),
+                     "result": None, "error": None}
+
+    async def _run() -> None:
+        job = _jobs[job_id]
+        try:
+            from spectrida.dynamic.vm_learn import learn_vm as _learn
+
+            def prog(msg):
+                job["progress"] = str(msg)[:200]
+
+            result = await asyncio.to_thread(_learn, steps, device, 100, prog)
+            job["result"] = result
+            job["status"] = "done"
+            job["progress"] = f"done: {result.get('coverage', 0)} behaviors, " \
+                              f"{result.get('growth_events', 0)} growth events"
+        except Exception as exc:
+            import traceback
+            job["status"] = "error"
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            job["progress"] = f"failed: {traceback.format_exc()[-400:]}"
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id, "status": "started", "binary": "(vm)",
+            "hint": f"call poll_analysis('{job_id}') — VM learning runs for a while"}
+
+
+@mcp.tool()
+async def live_trace(binary: str, addresses: list[str], binary_path: str = "",
+                     seconds: int = 3) -> dict:
+    """DYNAMIC (live): attach to the RUNNING target with Frida and capture what
+    the given functions actually do — real arguments, return values, call counts.
+
+    Use this for functions that emulate_function reports as `needs_state`: the
+    live process HAS the globals/heap/objects emulation can't build, so the
+    function runs for real. Writes dyn_live_* facts onto each hooked node.
+
+    ONLY for targets that actually run on THIS machine (native PE/ELF) — not
+    Switch NSO or other non-runnable images. Spawns/executes the target, so use
+    on binaries you trust (sandbox untrusted ones). Requires the optional 'atlas'
+    extra (pip install "spectrida[atlas]")."""
+    from spectrida import dynamic
+    dynamic.require()
+    from spectrida.dynamic.live import live_trace as _live_trace
+    from spectrida.dynamic.annotate import annotator
+
+    addrs = [_norm_addr(a) for a in addresses]
+    result = await asyncio.to_thread(
+        _live_trace, _g(), binary, addrs, binary_path or None, float(seconds))
+
+    ann = annotator(_g())
+    observed = result.get("observed", {})
+    for a in addrs:
+        obs = observed.get(hex(a))
+        facts = {"live_ran": bool(obs), "tool": "atlas-live"}
+        if obs:
+            facts["live_calls"] = obs["calls"]
+            facts["live_sample_args"] = obs["sample_args"]
+            facts["live_returns"] = obs["returns"]
+        try:
+            ann.annotate(binary, facts, addr=a)
+        except Exception:
+            pass
+    return result
+
+
+@mcp.tool()
+async def dynamic_overview(binary: str) -> dict:
+    """Summary of DYNAMIC (runtime) findings for a binary: how many functions have
+    been emulated/fuzzed/traced, how many crash (dyn_status='candidate_crash'),
+    how many need live state, and the top crash-bearing functions. Reads the dyn_*
+    annotations written by emulate_function / hunt_crashes / live_trace — the
+    runtime layer on top of the static graph."""
+    g = _g()
+    with g.driver.session() as s:
+        by_status = {r["st"]: r["n"] for r in s.run(
+            "MATCH (f:Function {binary:$b}) WHERE f.dyn_status IS NOT NULL "
+            "RETURN f.dyn_status AS st, count(f) AS n", b=binary)}
+        analyzed = s.run("MATCH (f:Function {binary:$b}) WHERE f.dyn_status IS NOT NULL "
+                         "RETURN count(f) AS n", b=binary).single()["n"]
+        traced = s.run("MATCH (f:Function {binary:$b}) WHERE f.dyn_live_ran = true "
+                       "RETURN count(f) AS n", b=binary).single()["n"]
+        top = [_hexify(dict(r)) for r in s.run(
+            "MATCH (f:Function {binary:$b}) WHERE coalesce(f.dyn_crashes,0) > 0 "
+            "RETURN f.addr AS addr, f.name AS name, f.dyn_crashes AS crashes, "
+            "f.dyn_status AS status ORDER BY f.dyn_crashes DESC LIMIT 15", b=binary)]
+    return {"binary": binary, "functions_analyzed": analyzed,
+            "by_status": by_status, "live_traced": traced,
+            "top_crash_functions": top}
+
+
+@mcp.tool()
+async def risk_functions(binary: str, top_n: int = 15) -> dict:
+    """Functions ranked by DYNAMIC risk — those Atlas found to crash or reach a
+    fault, most crash sites first. This is the runtime-evidence answer (unlike a
+    purely static heuristic): a function is here because it *actually* faulted
+    under emulation/fuzzing. Run emulate_function / hunt_crashes first to populate."""
+    g = _g()
+    with g.driver.session() as s:
+        rows = [_hexify(dict(r)) for r in s.run(
+            "MATCH (f:Function {binary:$b}) "
+            "WHERE f.dyn_status IN ['candidate_crash','needs_state'] "
+            "RETURN f.addr AS addr, f.name AS name, f.dyn_status AS status, "
+            "coalesce(f.dyn_crashes,0) AS crashes, f.dyn_crash_input AS crash_input "
+            "ORDER BY crashes DESC, f.dyn_status LIMIT $n", b=binary, n=top_n)]
+    return {"binary": binary, "functions": rows,
+            "note": "runtime evidence (emulation/fuzz), not a static heuristic"}
+
+
+@mcp.tool()
 async def populate_binary(
     binary: str, limit: int | None = None, min_size: int = 0,
 ) -> dict:
@@ -412,7 +655,9 @@ async def analyze_binary(
                 job["error"] = "analysis finished but no .i64 path was reported"
                 return
 
-            _g().register_binary(binary, i64_path)
+            # store the ORIGINAL binary path too, so dynamic tools locate its
+            # real bytes exactly (emulation/live) instead of heuristic guessing.
+            _g().register_binary(binary, i64_path, binary_path=path)
             out = {
                 "i64_path": i64_path,
                 "function_count": result.get("funcs"),

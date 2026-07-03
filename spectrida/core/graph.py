@@ -52,13 +52,29 @@ class FunctionGraph:
 
     # ── binary registry ────────────────────────────────────────────────────
 
-    def register_binary(self, tag: str, i64_path: str) -> None:
+    def register_binary(self, tag: str, i64_path: str,
+                        binary_path: str | None = None) -> None:
         """Record which .i64 file backs a `binary` tag, so tools that need
         live IDA access (full pseudocode, rename, fresh analysis) know where
-        to look instead of relying solely on the cached graph snapshot."""
+        to look instead of relying solely on the cached graph snapshot.
+
+        ``binary_path`` (optional) records the ORIGINAL binary file too, so the
+        dynamic-analysis tools (emulation/live) can find its real bytes exactly
+        instead of guessing from ~/.spectrida heuristics."""
         with self.driver.session() as s:
-            s.run("MERGE (b:Binary {tag: $tag}) SET b.i64_path = $path",
-                  tag=tag, path=i64_path)
+            if binary_path:
+                s.run("MERGE (b:Binary {tag: $tag}) "
+                      "SET b.i64_path = $path, b.binary_path = $bp",
+                      tag=tag, path=i64_path, bp=binary_path)
+            else:
+                s.run("MERGE (b:Binary {tag: $tag}) SET b.i64_path = $path",
+                      tag=tag, path=i64_path)
+
+    def set_binary_path(self, tag: str, binary_path: str) -> None:
+        """Record/update the original binary path for an already-registered tag."""
+        with self.driver.session() as s:
+            s.run("MERGE (b:Binary {tag: $tag}) SET b.binary_path = $bp",
+                  tag=tag, bp=binary_path)
 
     def delete_binary(self, tag: str) -> int:
         """Remove every Function node + edge for `tag`, plus its Binary
