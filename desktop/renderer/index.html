@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>spectrIDA</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- atmosphere layers -->
+  <div class="grain"></div>
+  <div class="scanlines"></div>
+  <div class="glow"></div>
+
+  <!-- top bar -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="ghost">👻</span>
+      <span class="wordmark">spectr<b>IDA</b></span>
+      <span class="tag">ghost through binaries</span>
+    </div>
+    <div class="top-actions">
+      <div class="status" id="status"><i class="dot"></i><span id="status-text">connecting…</span></div>
+      <button class="btn primary" id="index-btn"><span class="plus">+</span> Index a binary</button>
+    </div>
+  </header>
+
+  <!-- three-pane workbench -->
+  <main class="workbench">
+    <!-- left: binaries -->
+    <aside class="pane binaries">
+      <div class="pane-head"><span>Binaries</span><span class="count" id="bin-count"></span></div>
+      <div class="bin-list" id="bin-list"></div>
+    </aside>
+
+    <!-- middle: function list -->
+    <section class="pane functions">
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="search functions · or 0xADDRESS" autocomplete="off" />
+        <span class="search-hint" id="search-hint"></span>
+      </div>
+      <div class="fn-list" id="fn-list">
+        <div class="empty" id="fn-empty">select a binary</div>
+      </div>
+    </section>
+
+    <!-- right: function detail -->
+    <section class="pane detail" id="detail">
+      <div class="detail-empty" id="detail-empty">
+        <div class="watermark">👻</div>
+        <p>pick a function to haunt it</p>
+      </div>
+      <div class="detail-body" id="detail-body" hidden>
+        <div class="fn-title">
+          <h2 id="fn-name">—</h2>
+          <div class="fn-meta"><span id="fn-addr" class="mono"></span><span id="fn-size" class="chip"></span><span id="fn-dyn" class="chip"></span></div>
+        </div>
+
+        <div class="dyn-actions">
+          <button class="btn dyn" data-tool="emulate">⚡ Emulate</button>
+          <button class="btn dyn" data-tool="hunt">🩸 Hunt crashes</button>
+          <button class="btn dyn" data-tool="live">📡 Live trace</button>
+          <span class="dyn-result" id="dyn-result"></span>
+        </div>
+
+        <div class="tabs">
+          <button class="tab active" data-tab="pseudo">Pseudocode</button>
+          <button class="tab" data-tab="disasm">Disassembly</button>
+          <button class="tab" data-tab="xrefs">Xrefs</button>
+        </div>
+        <div class="tab-body">
+          <pre class="code" id="tab-pseudo"></pre>
+          <pre class="code" id="tab-disasm" hidden></pre>
+          <div class="xrefs" id="tab-xrefs" hidden></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- index-a-binary modal -->
+  <div class="modal-scrim" id="index-modal" hidden>
+    <div class="modal">
+      <div class="modal-head">Index a binary <button class="x" id="modal-close">✕</button></div>
+      <div class="dropzone" id="dropzone">
+        <div class="dz-ghost">👻</div>
+        <p>drop a binary here, or <button class="link" id="browse-btn">browse</button></p>
+        <span class="dz-path" id="dz-path"></span>
+      </div>
+      <div class="index-progress" id="index-progress" hidden>
+        <div class="ip-bar"><i id="ip-fill"></i></div>
+        <div class="ip-line mono" id="ip-line">queued…</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost-btn" id="start-index" disabled>Ghost through it →</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

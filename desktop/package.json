@@ -1,0 +1,14 @@
+{
+  "name": "spectrida-desktop",
+  "version": "0.1.0",
+  "description": "spectrIDA Desktop — ghost through binaries, with a GUI",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "ggfuchsi-oss",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
