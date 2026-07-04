@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phantomrt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Atlas — dynamic reverse-engineering: emulate, live-instrument, and fuzz functions, with a self-improving world model. The runtime companion to spectrIDA."
 readme = "README.md"
 requires-python = ">=3.10"

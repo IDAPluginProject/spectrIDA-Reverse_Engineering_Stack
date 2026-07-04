@@ -85,6 +85,21 @@ rpc.exports = {
         return true;
     },
 
+    hookMany: function (rvaList) {
+        rvaList.forEach(function (rva) {
+            Interceptor.attach(fnAddr(rva), {
+                onEnter: function (args) {
+                    this.p = args[0];
+                    try { this.s = args[0].readUtf8String(80); } catch (e) { this.s = null; }
+                },
+                onLeave: function (ret) {
+                    send({ t: 'call', rva: rva, arg: this.s, ret: ret.toInt32() });
+                }
+            });
+        });
+        return true;
+    },
+
     // call fn(char* input) -> int, with live process state present
     callStr: function (rva, s) {
         const fn = new NativeFunction(fnAddr(rva), 'int', ['pointer']);
@@ -144,6 +159,7 @@ class FridaLiveTarget:
         self.script = None
         self._events: list = []
         self._dead = False
+        self._hooks_installed = False
         self._last_crash = None      # set by _on_message the instant a crash arrives
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -167,14 +183,22 @@ class FridaLiveTarget:
                 "kind": getattr(crash, "signal_name", None) or reason or "crash",
             }
 
-    def spawn(self) -> "FridaLiveTarget":
+    def spawn(self, rvas: list[int] | None = None) -> "FridaLiveTarget":
         self._dead = False
+        self._hooks_installed = False
         self.pid = self.device.spawn(self.program)
         self.session = self.device.attach(self.pid)
         self.session.on("detached", self._on_detached)
         self.script = self.session.create_script(_AGENT)
         self.script.on("message", self._on_message)
         self.script.load()
+        # Install trace hooks BEFORE resume so we catch the very first call.
+        if rvas:
+            try:
+                self.script.exports_sync.hook_many([hex(r) for r in rvas])
+                self._hooks_installed = True
+            except Exception as e:
+                self.log(f"[live] hookMany failed: {e}")
         self.device.resume(self.pid)
         return self
 
@@ -189,12 +213,15 @@ class FridaLiveTarget:
     # ── passive tracing: what really runs, with real args ────────────────────
     def trace(self, rvas: list[int], seconds: float = 2.0) -> list[LiveTrace]:
         if self.script is None:
-            self.spawn()
-        for rva in rvas:
-            try:
-                self.script.exports_sync.hook(hex(rva))
-            except Exception as e:
-                self.log(f"[live] hook {hex(rva)} failed: {e}")
+            self.spawn(rvas=rvas)
+        elif not self._hooks_installed:
+            # Already spawned (e.g. fuzz path) — install hooks now.
+            for rva in rvas:
+                try:
+                    self.script.exports_sync.hook(hex(rva))
+                except Exception as e:
+                    self.log(f"[live] hook {hex(rva)} failed: {e}")
+            self._hooks_installed = True
         time.sleep(seconds)
         out = []
         for e in self._events:

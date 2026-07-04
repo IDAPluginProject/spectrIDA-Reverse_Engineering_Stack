@@ -35,7 +35,7 @@ def live_trace(graph, tag: str, addresses: list[int], binary_path: str | None = 
 
     target = FridaLiveTarget(program)
     try:
-        target.spawn()
+        target.spawn(rvas=rvas)
         traces = target.trace(rvas, seconds=seconds)
     finally:
         target.close()

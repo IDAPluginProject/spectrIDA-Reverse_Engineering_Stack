@@ -13,6 +13,7 @@ import pytest
 frida = pytest.importorskip("frida")
 
 TARGET = os.path.join(os.path.dirname(__file__), "..", "experiments", "live", "target.exe")
+ONCE_TARGET = os.path.join(os.path.dirname(__file__), "..", "experiments", "live", "once.exe")
 CHECK_RVA = 0x1760
 
 pytestmark = [
@@ -37,6 +38,25 @@ def _reap_zombies():
 def _target():
     from atlas.analysis.frida_live import FridaLiveTarget
     return FridaLiveTarget(os.path.abspath(TARGET), log=lambda *a: None)
+
+
+@pytest.mark.skipif(not os.path.exists(ONCE_TARGET),
+                    reason="once.exe (single-call target) not built")
+def test_trace_catches_once_at_startup_call():
+    """Regression: the function is called exactly ONCE, early, then the process
+    idles. If hooks go in AFTER resume (the old bug), the call is already gone and
+    trace() returns 0. Hooks must be installed BEFORE resume."""
+    from atlas.analysis.frida_live import FridaLiveTarget
+    t = FridaLiveTarget(os.path.abspath(ONCE_TARGET), log=lambda *a: None)
+    try:
+        t.spawn(rvas=[CHECK_RVA])            # hooks BEFORE resume
+        traces = t.trace([CHECK_RVA], seconds=2.0)
+        assert len(traces) >= 1              # the single startup call was caught
+        assert traces[0].ret == len("hello_once")
+    finally:
+        t.close()
+        import subprocess
+        subprocess.run(["taskkill", "/F", "/IM", "once.exe"], capture_output=True)
 
 
 def test_rva_from_graph_addr():
