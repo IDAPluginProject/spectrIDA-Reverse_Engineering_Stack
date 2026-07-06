@@ -14,6 +14,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 
+from spectrida.verify.helpers import parse_struct_layout, find_external_calls, estimate_function_complexity
 from spectrida.verify.oracle import (
     EmulationResult,
     OracleVerdict,
@@ -203,6 +204,10 @@ async def lift_function(
         for attempt_num in range(1, max_attempts + 1):
             attempt = LiftAttempt(attempt_num=attempt_num)
 
+            # Analyze function context
+            ctx = estimate_function_complexity(pseudocode)
+            externals = find_external_calls(pseudocode)
+            
             # 1. Build prompt
             if previous_c and attempt_num > 1:
                 user_msg = REPAIR_PROMPT_TEMPLATE.format(
