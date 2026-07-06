@@ -59,14 +59,11 @@ def check_eligibility(pseudocode: str) -> bool:
     if not pseudocode:
         return False
 
-    # Reject if it calls external functions we can't emulate
+    # Reject only hard externals — syscalls, I/O, threading
     external_calls = [
-        "syscall", "svc ", "swi ", "int ",  # system calls
-        "malloc", "free", "calloc", "realloc",  # heap
+        "syscall", "svc ", "swi ", "int 0x",  # system calls
         "printf", "fprintf", "snprintf",  # I/O
-        "memcpy", "memset", "memmove",  # memory (might be ok, but complex)
-        "strlen", "strcmp", "strncmp",  # string (might be ok)
-        "open", "close", "read", "write",  # file I/O
+        "open(", "close(", "read(", "write(",  # file I/O
         "pthread", "mutex",  # threading
     ]
 
