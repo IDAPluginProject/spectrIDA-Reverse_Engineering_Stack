@@ -953,6 +953,60 @@ async def get_rtti(binary: str) -> dict:
 
 
 
+@mcp.tool()
+async def get_referenced_knowledge(binary: str, address: str) -> dict:
+    """IDB-as-RAG: get what IDA knows about addresses referenced by a function.
+
+    Extracts all code/data/string references from the function body,
+    then looks up names, comments, types, and string values at each.
+    This is the knowledge that gets injected into the naming prompt
+    alongside the N-hop callgraph context.
+
+    Use this to preview what context a function would receive before
+    a naming run.
+    """
+    from spectrida.idb_knowledge import harvest_references, gather_knowledge
+
+    db = await _live_db(binary)
+    addr = _norm_addr(address)
+
+    refs = await harvest_references(db, addr)
+    knowledge = await gather_knowledge(db, refs)
+
+    return {
+        "address": address,
+        "references": {
+            "code": len(refs.get("code", [])),
+            "data": len(refs.get("data", [])),
+            "string": len(refs.get("string", [])),
+        },
+        "knowledge": [
+            {"addr": e.addr, "name": e.name, "comment": e.comment,
+             "type": e.type_str, "string": e.string_val}
+            for e in knowledge[:15]
+        ],
+    }
+
+
+@mcp.tool()
+async def write_function_name(
+    binary: str, address: str, name: str, comment: str = "",
+) -> dict:
+    """Rename a function and optionally add a comment in the live IDB.
+
+    This is the write-back mechanism: after naming a function, the name
+    and comment persist to the IDB so that:
+      1. Other functions referencing this address see the new name
+      2. The two-pass pipeline's pass-2 picks up pass-1's corrections
+      3. Human fixes propagate automatically on next run
+    """
+    db = await _live_db(binary)
+    addr = _norm_addr(address)
+    ok = await db.write_name(addr, name, comment)
+    return {"renamed": ok, "address": address, "name": name, "comment": comment}
+
+
+
 def main() -> None:
     mcp.run()
 

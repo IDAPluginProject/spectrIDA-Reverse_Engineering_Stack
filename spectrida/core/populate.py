@@ -198,7 +198,7 @@ async def populate_graph(
 
             attempted_count += sum(1 for p in pending if p["needs_naming"])
             results = await asyncio.gather(
-                *[_name_with_ctx(p, graph, binary, http, llama_url, model) if p["needs_naming"]
+                *[_name_with_ctx(p, graph, binary, http, llama_url, model, db=db) if p["needs_naming"]
                   else _const("") for p in pending],
                 return_exceptions=True,
             )
@@ -239,8 +239,8 @@ async def populate_graph(
                 old_name = data["name"]
                 ctx_block = ""
                 try:
-                    ctx = gather_context(graph, binary, addr, depth=2,
-                                         max_neighbors=10, pseudocode=data["pseudocode"])
+                    ctx = await gather_context(graph, binary, addr, depth=2,
+                                         max_neighbors=10, pseudocode=data["pseudocode"], db=db)
                     ctx_block = format_context_block(ctx)
                 except Exception:
                     pass
@@ -282,16 +282,24 @@ async def _name_with_ctx(
     http: httpx.AsyncClient,
     llama_url: str,
     ollama_model: str = "",
+    db=None,
 ) -> str:
     """Name a single function with N-hop context from the graph."""
     ctx_block = ""
     try:
-        ctx = gather_context(graph, binary, p["addr"], depth=2,
-                             max_neighbors=10, pseudocode=p["pseudocode"])
+        ctx = await gather_context(graph, binary, p["addr"], depth=2,
+                             max_neighbors=10, pseudocode=p["pseudocode"], db=db)
         ctx_block = format_context_block(ctx)
     except Exception:
         pass
-    return await name_from_pseudocode(
+    name = await name_from_pseudocode(
         p["pseudocode"], http, llama_url,
         context_block=ctx_block, ollama_model=ollama_model,
     )
+    # Write-back: persist name to IDB so downstream functions see it
+    if name and db is not None:
+        try:
+            await db.write_name(p["addr"], name)
+        except Exception:
+            pass
+    return name

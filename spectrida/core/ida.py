@@ -169,6 +169,93 @@ for line in sys.stdin:
                                               "rtti": rtti[:50], "vtables": vtables[:50]}})
             except Exception as e:
                 emit({"ok": True, "result": {"rtti_symbols": 0, "vtable_slots": 0, "error": str(e)}})
+        elif cmd == "refs":
+            # Get ALL referenced addresses from a function body:
+            # code refs (calls/jumps), data refs (globals/tables), string refs.
+            # This is the raw material for IDB-as-RAG.
+            try:
+                addr = _norm(a["address"])
+                fn = idaapi.get_func(addr)
+                refs = {"code": [], "data": [], "string": []}
+                if fn:
+                    for ea in idautils.FuncItems(fn.start_ea):
+                        # Code references (calls, jumps)
+                        for xr in idautils.XrefsFrom(ea, 0):
+                            tgt = xr.to
+                            name = idc.get_func_name(tgt) or idc.get_name(tgt) or ""
+                            refs["code"].append({"addr": hex(tgt), "name": name})
+                        # Data references (globals, tables)
+                        for xr in idautils.DataRefsFrom(ea):
+                            name = idc.get_name(xr) or ""
+                            refs["data"].append({"addr": hex(xr), "name": name})
+                        # String references
+                        for xr in idautils.DataRefsFrom(ea):
+                            if idc.get_segm_name(xr) and "string" in idc.get_segm_name(xr).lower():
+                                val = idc.get_strlit_contents(xr)
+                                if val:
+                                    refs["string"].append({"addr": hex(xr), "value": val.decode(errors="replace")[:80]})
+                # Dedupe
+                for k in refs:
+                    seen = set()
+                    deduped = []
+                    for r in refs[k]:
+                        key = r.get("addr", "")
+                        if key not in seen:
+                            seen.add(key)
+                            deduped.append(r)
+                    refs[k] = deduped[:30]  # cap per type
+                emit({"ok": True, "result": refs})
+            except Exception as e:
+                emit({"ok": True, "result": {"code": [], "data": [], "string": [], "error": str(e)}})
+        elif cmd == "knowledge":
+            # Look up what IDA knows at a set of addresses:
+            # name, comments (anterior/posterior/repeatable), type, string value.
+            # This is the IDB-as-RAG knowledge extraction.
+            try:
+                addrs = a.get("addresses", [])
+                results = []
+                for addr_str in addrs:
+                    ea = _norm(addr_str)
+                    entry = {"addr": addr_str, "name": "", "comment": "", "type": "", "string": ""}
+                    # Name (skip default placeholders)
+                    name = idc.get_name(ea) or ""
+                    # Keep 'a' prefixed names (string labels) — they contain the string content
+                    noise = ("sub_", "dword_", "off_", "loc_", "unk_", "byte_", "word_", "qword_")
+                    if name and not name.startswith(noise):
+                        entry["name"] = name
+                    # Comments (posterior is most common, anterior is above)
+                    cmt = idc.get_cmt(ea, 0) or ""  # posterior
+                    if not cmt:
+                        cmt = idc.get_cmt(ea, 1) or ""  # anterior
+                    if cmt:
+                        entry["comment"] = cmt[:120]
+                    # Type
+                    t = ""
+                    if t:
+                        entry["type"] = t[:60]
+                    # String value
+                    if idc.get_segm_name(ea) and "string" in idc.get_segm_name(ea).lower():
+                        val = idc.get_strlit_contents(ea)
+                        if val:
+                            entry["string"] = val.decode(errors="replace")[:80]
+                    # Only include if there's something meaningful
+                    if entry["name"] or entry["comment"] or entry["type"] or entry["string"]:
+                        results.append(entry)
+                emit({"ok": True, "result": results[:30]})
+            except Exception as e:
+                emit({"ok": True, "result": [], "error": str(e)})
+        elif cmd == "write_name":
+            # Rename a function and optionally add a comment (for write-back loop).
+            try:
+                addr = _norm(a["address"])
+                name = a.get("name", "")
+                comment = a.get("comment", "")
+                ok = idc.set_name(addr, name, idc.SN_NOWARN | idc.SN_NOCHECK)
+                if comment:
+                    idc.set_cmt(addr, comment, 0)  # posterior comment
+                emit({"ok": True, "result": bool(ok)})
+            except Exception as e:
+                emit({"ok": True, "result": False, "error": str(e)})
         else:
             emit({"ok": False, "error": "unknown cmd %s" % cmd})
     except Exception as e:
@@ -317,3 +404,26 @@ async def rtti(ida: IDAHandle) -> dict:
 
 def _hex(address: str | int) -> str:
     return hex(address) if isinstance(address, int) else str(address)
+
+async def refs(ida: IDAHandle, address: int | str) -> dict:
+    """Get all referenced addresses from a function body."""
+    try:
+        return await ida.call("refs", address=hex(address) if isinstance(address, int) else str(address))
+    except Exception:
+        return {"code": [], "data": [], "string": []}
+
+async def knowledge(ida: IDAHandle, addresses: list[str]) -> list[dict]:
+    """Look up what IDA knows at a set of addresses."""
+    try:
+        return await ida.call("knowledge", addresses=addresses)
+    except Exception:
+        return []
+
+async def write_name(ida: IDAHandle, address: int | str, name: str, comment: str = "") -> bool:
+    """Rename a function and optionally add a comment."""
+    try:
+        return await ida.call("write_name", address=hex(address) if isinstance(address, int) else str(address), name=name, comment=comment)
+    except Exception:
+        return False
+
+

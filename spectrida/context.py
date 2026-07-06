@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from spectrida.idb_knowledge import harvest_references, gather_knowledge, format_knowledge_block as _format_idb_block
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -56,6 +57,7 @@ class FunctionContext:
     strings: list[str] = field(default_factory=list)
     constants: list[int] = field(default_factory=list)
     summary: str = ""
+    idb_knowledge: list = field(default_factory=list)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -202,7 +204,7 @@ def extract_constants(pseudocode: str, max_constants: int = 6) -> list[int]:
 
 # ── main entry point ─────────────────────────────────────────────────────────
 
-def gather_context(
+async def gather_context(
     graph,
     binary: str,
     func_addr: int,
@@ -210,6 +212,7 @@ def gather_context(
     depth: int = 2,
     max_neighbors: int = 10,
     pseudocode: str = "",
+    db=None,
 ) -> FunctionContext:
     """Gather N-hop context for a function.
 
@@ -247,6 +250,16 @@ def gather_context(
         constants=constants,
         summary="; ".join(extras),
     )
+
+    # Phase 3: IDB-as-RAG — harvest referenced knowledge
+    if db is not None:
+        try:
+            refs = await harvest_references(db, func_addr)
+            knowledge = await gather_knowledge(db, refs)
+            ctx.idb_knowledge = knowledge
+        except Exception:
+            ctx.idb_knowledge = []
+
     return ctx
 
 
