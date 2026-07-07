@@ -95,6 +95,106 @@ def extract_function_bytes(dll_path: str, func_name: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def populate_struct(
+    mu,
+    ptr_addr: int,
+    layout: dict,
+    values: dict | None = None,
+) -> None:
+    """Populate a struct in emulator memory from its layout.
+    
+    Args:
+        mu: Unicorn emulator instance
+        ptr_addr: base address of the struct
+        layout: dict of field_name -> (offset, size_in_bytes)
+        values: optional dict of field_name -> value (defaults to index-based)
+    """
+    import struct as _struct
+    
+    for field_name, (offset, size) in layout.items():
+        if values and field_name in values:
+            val = values[field_name]
+        else:
+            val = list(layout.keys()).index(field_name)
+        
+        if size == 1:
+            packed = _struct.pack("<b", val & 0xFF)
+        elif size == 2:
+            packed = _struct.pack("<h", val & 0xFFFF)
+        elif size == 4:
+            packed = _struct.pack("<i", val)
+        elif size == 8:
+            packed = _struct.pack("<q", val)
+        else:
+            packed = _struct.pack("<i", val)
+        
+        mu.mem_write(ptr_addr + offset, packed)
+
+
+def emulate_with_struct(
+    code_bytes: bytes,
+    struct_layout: dict,
+    struct_values: dict | None = None,
+    *,
+    struct_addr: int = 0x30000,
+    arg_index: int = 0,
+    extra_args: list | None = None,
+) -> EmulationResult:
+    """Emulate a function with a struct pointer argument."""
+    from unicorn import Uc, UC_ARCH_X86, UC_MODE_64
+    from unicorn.x86_const import (
+        UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX,
+        UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_RSP, UC_X86_REG_RBP,
+    )
+    
+    try:
+        mu = Uc(UC_ARCH_X86, UC_MODE_64)
+        mu.mem_map(0x0, 0x100000)
+        mu.mem_write(0x10000, code_bytes)
+        
+        mu.reg_write(UC_X86_REG_RSP, 0x7FF00)
+        mu.reg_write(UC_X86_REG_RBP, 0x7FF00)
+        
+        arg_regs = [UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9]
+        
+        if arg_index < len(arg_regs):
+            mu.reg_write(arg_regs[arg_index], struct_addr)
+        
+        if extra_args:
+            for i, arg in enumerate(extra_args):
+                if i + 1 < len(arg_regs):
+                    mu.reg_write(arg_regs[i + 1], arg)
+        
+        populate_struct(mu, struct_addr, struct_layout, struct_values)
+        
+        code_len = len(code_bytes)
+        stop_addr = 0x10000 + code_len
+        for i in range(code_len - 1, -1, -1):
+            if code_bytes[i] in (0xc3, 0xc9, 0xcb):
+                stop_addr = 0x10000 + i
+                break
+        
+        mu.emu_start(0x10000, stop_addr, timeout=100000)
+        
+        ret = mu.reg_read(UC_X86_REG_RAX)
+        
+        memory_writes = {}
+        struct_size = max(offset + size for offset, size in struct_layout.values())
+        try:
+            struct_data = bytes(mu.mem_read(struct_addr, struct_size))
+            memory_writes[struct_addr] = struct_data
+        except Exception:
+            pass
+        
+        return EmulationResult(
+            return_value=ret,
+            memory_writes=memory_writes,
+            memory_hash=str(hash(struct_data)) if memory_writes else "empty",
+        )
+    except Exception as e:
+        return EmulationResult(error=f"struct emulation error: {e}")
+
+
 def emulate_function(
     code_bytes: bytes,
     base_addr: int = 0x10000,
