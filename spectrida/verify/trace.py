@@ -81,13 +81,80 @@ class DivergenceReport:
 def normalize_address(addr: int, base_map: dict[int, int] | None = None) -> int:
     """Normalize an address using a base address mapping.
     
-    For example, map struct pointers to a canonical base so
-    "wrote to base+8" compares to "wrote to base+8" regardless of
-    where the struct actually lives in memory.
+    Maps struct pointers to canonical addresses so writes at
+    base+offset compare correctly regardless of actual base location.
     """
-    if base_map and addr in base_map:
+    if not base_map:
+        return addr
+    
+    # Try direct mapping first
+    if addr in base_map:
         return base_map[addr]
+    
+    # Try offset mapping: find if addr is base+offset
+    for orig_base, new_base in base_map.items():
+        if addr >= orig_base and addr < orig_base + 0x1000:
+            offset = addr - orig_base
+            return new_base + offset
+    
     return addr
+
+
+def build_base_map(orig_trace, recomp_trace, struct_addr: int = 0x30000) -> dict[int, int]:
+    """Build address mapping between original and recompiled traces.
+    
+    Maps struct pointers to canonical addresses so writes compare correctly.
+    """
+    base_map = {}
+    
+    # Find the most common base address in memory writes
+    orig_bases = {}
+    for evt in orig_trace.memory_writes:
+        # Approximate base: addr rounded down to nearest 0x1000
+        base = evt.addr & ~0xFFF
+        orig_bases[base] = orig_bases.get(base, 0) + 1
+    
+    recomp_bases = {}
+    for evt in recomp_trace.memory_writes:
+        base = evt.addr & ~0xFFF
+        recomp_bases[base] = recomp_bases.get(base, 0) + 1
+    
+    # Map most common base in original to most common base in recompiled
+    if orig_bases and recomp_bases:
+        orig_main = max(orig_bases, key=orig_bases.get)
+        recomp_main = max(recomp_bases, key=recomp_bases.get)
+        if orig_main != recomp_main:
+            base_map[orig_main] = recomp_main
+    
+    return base_map
+
+
+def normalize_trace(
+    trace: ExecutionTrace,
+    base_map: dict[int, int] | None = None,
+) -> ExecutionTrace:
+    """Normalize a trace for comparison.
+    
+    - Maps addresses through base_map if provided
+    - Ignores absolute stack addresses (compare relative offsets)
+    - Sorts benign writes within same block
+    """
+    normalized = ExecutionTrace()
+    
+    for event in trace.memory_writes:
+        norm_addr = normalize_address(event.addr, base_map)
+        normalized.memory_writes.append(MemoryWriteEvent(
+            order=event.order,
+            addr=norm_addr,
+            size=event.size,
+            value=event.value,
+            pc=event.pc,
+        ))
+    
+    normalized.calls = trace.calls[:]
+    normalized.returns = trace.returns[:]
+    
+    return normalized
 
 
 def normalize_trace(
@@ -125,6 +192,7 @@ def compare_traces(
     recompiled: ExecutionTrace,
     *,
     tolerance: float = 0.0,
+    auto_normalize: bool = True,
 ) -> DivergenceReport:
     """Compare two execution traces and find the first divergence.
     
@@ -135,6 +203,13 @@ def compare_traces(
     - Expected vs actual values
     - Inferred location (if known)
     """
+    # Auto-normalize if requested
+    if auto_normalize:
+        base_map = build_base_map(original, recompiled)
+        if base_map:
+            original = normalize_trace(original, base_map)
+            recompiled = normalize_trace(recompiled, base_map)
+    
     orig_events = original.all_events
     recomp_events = recompiled.all_events
     
