@@ -33,13 +33,13 @@ def compile_c_to_shared(c_code: str, out_path: str) -> dict:
     os.write(fd, c_code.encode())
     os.close(fd)
     try:
-        gcc_path = r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\gcc.exe"
+        gcc_path = r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\g++.exe"
         if not os.path.exists(gcc_path):
             import shutil
             gcc_path = shutil.which("gcc") or ""
         if not gcc_path:
             return {"ok": False, "error": "gcc not found"}
-        cmd = [gcc_path, "-O2", "-nostdlib", "-shared", "-o", out_path, c_file]
+        cmd = [gcc_path, "-O2", "-std=c++11", "-nostdlib", "-shared", "-o", out_path, c_file]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
             return {"ok": True, "path": out_path}

@@ -185,50 +185,53 @@ def _extract_struct_context(pseudocode: str) -> str:
 
 
 def _normalize_types(code: str) -> str:
-    """Add a dummy struct definition for this-> access."""
-    # Add struct definition before the function
-    struct_def = 'typedef struct { unsigned long long fields[10]; unsigned int flags; } this_struct;' + chr(10) + chr(10)
+    """Normalize C++ pseudocode for GCC C++ compilation."""
+    import re
 
-    code = struct_def + code
-    """Normalize MSVC types to GCC-compatible types."""
-    # Replace MSVC types with GCC equivalents
+    # Step 1: Rename 'this' to 'self' (reserved in C++)
+    code = code.replace("this", "self")
+
+    # Step 2: Replace void* parameter with ThisStruct*
+    # Pattern: (void* varname) -> (ThisStruct* varname)
+    code = re.sub(r"\(void\* (\w+)\)", r"(ThisStruct* \1)", code)
+
+
+
+    # Step 4: Replace MSVC types with GCC equivalents
     replacements = [
-        ('__int64', 'long long'),
-        ('__int32', 'int'),
-        ('__int16', 'short'),
-        ('__int8', 'char'),
-        ('_BYTE', 'unsigned char'),
-        ('_WORD', 'unsigned short'),
-        ('_DWORD', 'unsigned int'),
-        ('_QWORD', 'unsigned long long'),
-        ('__fastcall', ''),
-        ('__cdecl', ''),
+        ("__int64", "long long"),
+        ("__int32", "int"),
+        ("__int16", "short"),
+        ("__int8", "char"),
+        ("_BYTE", "unsigned char"),
+        ("_WORD", "unsigned short"),
+        ("_DWORD", "unsigned int"),
+        ("_QWORD", "unsigned long long"),
+        ("__fastcall", ""),
+        ("__cdecl", ""),
     ]
     for old, new in replacements:
         code = code.replace(old, new)
-    
-    # Replace unknown struct types with void*
-    # Find type names that aren't C keywords or common types
-    import re
-    known_types = {'int', 'long', 'char', 'void', 'float', 'double', 'unsigned',
-                   'signed', 'short', 'struct', 'union', 'enum', 'const', 'static',
-                   'extern', 'volatile', 'inline', 'register', 'auto', 'typedef',
-                   'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'break',
-                   'continue', 'return', 'goto', 'sizeof', 'NULL', 'true', 'false'}
-    
+
+    # Step 5: Replace unknown struct types with ThisStruct*
+    known_types = {"int", "long", "char", "void", "float", "double", "unsigned",
+                   "signed", "short", "struct", "union", "enum", "const", "static",
+                   "extern", "volatile", "inline", "register", "auto", "typedef",
+                   "if", "else", "while", "for", "do", "switch", "case", "break",
+                   "continue", "return", "goto", "sizeof", "NULL", "true", "false"}
+
     def replace_unknown_type(match):
         type_name = match.group(1)
-        if type_name.lower() in known_types or type_name.startswith('uint') or type_name.startswith('int'):
-            return match.group(0)  # Keep known types
-        return f'void* {match.group(2)}'  # Replace unknown with void*
-    
-    # Find function parameters with unknown types
-    code = re.sub(r'(\w+)\s+\*(\w+)', replace_unknown_type, code)
-    
-    # Convert this-> to struct access
-    # this->field becomes this_struct.field
-    code = code.replace('this->', 'this_struct.')
-    
+        if type_name.lower() in known_types or type_name.startswith("uint") or type_name.startswith("int"):
+            return match.group(0)
+        return f"ThisStruct* {match.group(2)}"
+
+    code = re.sub(r"(\w+)\s+\*(\w+)", replace_unknown_type, code)
+
+    # Step 6: Add struct definition before the function
+    struct_def = "typedef struct { unsigned long long vtable, m_archive, m_name, m_fileSize, m_dataSize, m_offset, m_entryIndex, m_childCount, m_childList0, m_childList1, m_childList2; unsigned int m_flags, m_entryType; } ThisStruct;" + chr(10) + chr(10)
+    code = struct_def + code
+
     return code
 
 
