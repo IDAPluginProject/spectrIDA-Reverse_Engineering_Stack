@@ -1,384 +1,135 @@
-"""Self-verifying decompilation loop.
-
-Feed pseudocode to the model → compile → emulate → compare with original.
-On mismatch, feed the behavioral diff back as a repair hint and retry.
-
-This is the core loop that turns plausible-looking decompilation into
-provably-correct, editable source.
-"""
+"""Self-verifying decompilation loop."""
 from __future__ import annotations
 
-import os
-
 import asyncio
+import os
 import re
 from dataclasses import dataclass, field
 
-from spectrida.verify.helpers import parse_struct_layout, find_external_calls, estimate_function_complexity
 from spectrida.verify.oracle import (
-    EmulationResult,
-    OracleVerdict,
-    compile_c_to_shared,
-    emulate_function,
-    compare_emulations,
-    extract_function_bytes,
+    OracleVerdict, compile_c_to_shared,
+    emulate_function, compare_emulations, extract_function_bytes,
 )
-from spectrida.verify.capture_replay import capture_external_calls, replay_with_stubs, compare_with_replay
-from spectrida.verify.symbols import generate_symbol_stubs_from_pseudocode
 
+NL = chr(10)
+_LT = "<"
+_GT = ">"
 
-# ── Types ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class LiftAttempt:
-    """One attempt at lifting a function to C."""
-    attempt_num: int
+    attempt_num: int = 0
     c_code: str = ""
     compiled: bool = False
     compile_error: str = ""
     verified: bool = False
     verdict: OracleVerdict | None = None
-    oracle_error: str = ""
 
 
 @dataclass
 class LiftResult:
-    """Final result of the self-verifying loop."""
-    func_name: str
+    func_name: str = ""
     verified_c: str = ""
-    attempts: list[LiftAttempt] = field(default_factory=list)
-    final_verdict: OracleVerdict | None = None
+    attempts: list = field(default_factory=list)
     total_attempts: int = 0
     success: bool = False
 
 
-# ── Prompt ───────────────────────────────────────────────────────────────────
-
-LIFT_SYSTEM = (
-    "You are an expert C programmer specializing in reverse engineering. "
-    "Given Hex-Rays pseudocode from a stripped binary, produce clean, "
-    "compilable C code. The output must be a complete function with:\n"
-    "- Correct types (use int, long long, void*, etc. based on context)\n"
-    "- Correct return type\n"
-    "- No placeholders or TODOs\n"
-    "- No external function calls (implement inline if needed)\n"
-    "- Just the function, no headers or main\n\n"
-    "IMPORTANT: The code must compile with gcc -O2 -nostdlib -shared."
-)
-
-LIFT_PROMPT_TEMPLATE = (
-    "Convert this pseudocode to compilable C:\n\n"
-    "```c\n{pseudocode}\n```\n\n"
-    "Return ONLY the C function, nothing else."
-)
-
-REPAIR_PROMPT_TEMPLATE = (
-    "Your previous C code had issues. Here's the feedback:\n\n"
-    "{feedback}\n\n"
-    "Original pseudocode:\n```c\n{pseudocode}\n```\n\n"
-    "Your previous attempt:\n```c\n{previous_c}\n```\n\n"
-    "Fix the issues and return ONLY the corrected C function."
-)
-
-
-# ── Model interaction ────────────────────────────────────────────────────────
-
-async def _query_model(
-    http: httpx.AsyncClient,
-    ollama_url: str,
-    system: str,
-    user_msg: str,
-    *,
-    ollama_model: str = "",
-    temperature: float = 0.3,
-) -> str:
-    """Query the model for C code generation."""
-    import json
-
-    # Build ChatML prompt
-    NL = "\n"
-    LT = "<"
-    GT = ">"
-    BT = "`"
-
-    prompt = (
-        LT + "im" + GT + "system" + LT + "/im" + GT + NL + system + LT + "/im" + GT + NL
-        + LT + "im" + GT + "user" + LT + "/im" + GT + NL + user_msg + LT + "/im" + GT + NL
-        + LT + "im" + GT + "assistant" + LT + "/im" + GT + NL
-    )
-
-    if ollama_model:
-        url = ollama_url.rstrip("/") + "/api/generate"
-        payload = {
-            "model": ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "think": False,
-            "options": {"temperature": temperature, "num_predict": 1024},
-        }
-        resp = await http.post(url, json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
-    else:
-        payload = {
-            "prompt": prompt,
-            "temperature": temperature,
-            "n_predict": 1024,
-        }
-        resp = await http.post(ollama_url, json=payload)
-        resp.raise_for_status()
-        return resp.json().get("content", "").strip()
-
-
-NL = chr(10)
-
 def _extract_struct_context(pseudocode: str) -> str:
-    """Extract struct definitions from pseudocode for the model prompt."""
-    import re
-    
-    structs = []
-    
-    # Find struct field accesses in both styles:
-    # Style 1: *((TYPE *)this + offset)
-    # Style 2: ptr->field_name
     type_offsets = {}
-    field_names = {}
-    
-    # Style 1: *((TYPE *)this + offset)
-    for m in re.finditer(r'\*\(\((\w+)\s*\*\)\s*\((\w+)\s*\+\s*(\d+)\)\)', pseudocode):
+    for m in re.finditer(r"\*\(\((\w+)\s*\*\)\s*\((\w+)\s*\+\s*(\d+)\)", pseudocode):
         field_type = m.group(1)
         offset = int(m.group(3))
         if field_type not in type_offsets:
             type_offsets[field_type] = []
         type_offsets[field_type].append(offset)
-    
-    # Style 2: ptr->field_name (infer offset from order)
-    for m in re.finditer(r'(\w+)->(\w+)', pseudocode):
-        ptr_name = m.group(1)
-        field_name = m.group(2)
-        if ptr_name not in field_names:
-            field_names[ptr_name] = []
-        field_names[ptr_name].append(field_name)
-    
-    # Build struct definitions from type-offset pairs
-    for field_type, offsets in type_offsets.items():
+    structs = []
+    for ft, offsets in type_offsets.items():
         offsets.sort()
-        struct_name = "GameData"  # Generic name
-        fields = []
-        for i, offset in enumerate(offsets):
-            field_name = f"field_{offset}"
-            fields.append(f"    {field_type} {field_name};")
-        
-        struct_def = "typedef struct {" + NL + NL.join(fields) + NL + "} " + struct_name + ";"
-        structs.append(struct_def)
-    
-    # Build struct definitions from ptr->field patterns
-    for ptr_name, fields in field_names.items():
-        if len(fields) >= 2:  # Only if we have multiple fields
-            struct_name = ptr_name.capitalize() + "Data"
-            struct_fields = []
-            for i, field_name in enumerate(fields):
-                struct_fields.append(f"    int {field_name};")  # Assume int for now
-            
-            struct_def = "typedef struct {" + NL + NL.join(struct_fields) + NL + "} " + struct_name + ";"
-            structs.append(struct_def)
-    
+        fields = [f"    {ft} field_{o};" for o in offsets]
+        structs.append("typedef struct {" + NL + NL.join(fields) + NL + "}")
     return NL.join(structs) if structs else ""
 
 
 def _normalize_types(code: str) -> str:
-    """Normalize C++ pseudocode for GCC C++ compilation."""
-    import re
-
-    # Step 1: Strip namespaces and casts
-    # Remove (Type *) casts — replace with (void *)
-    code = re.sub(r'\(\w+\s*\*\s*\)', '0', code)
-    # Strip remaining namespaces (al::, sead::, etc.)
     code = re.sub(r"\w+::", "", code)
-    
-    # Step 2: Rename 'this' to 'self' (reserved in C++)
     code = code.replace("this", "self")
-
-    # Step 2: Replace void* parameter with ThisStruct*
-    # Pattern: (void* varname) -> (ThisStruct* varname)
     code = re.sub(r"\(void\* (\w+)\)", r"(ThisStruct* \1)", code)
-
-
-
-    # Step 7: Replace MSVC types with GCC equivalents
-    replacements = [
-        ("__int64", "long long"),
-        ("__int32", "int"),
-        ("__int16", "short"),
-        ("__int8", "char"),
-        ("_BYTE", "unsigned char"),
-        ("_WORD", "unsigned short"),
-        ("_DWORD", "unsigned int"),
-        ("_QWORD", "unsigned long long"),
-        ("__fastcall", ""),
-        ("__cdecl", ""),
-        ("int64_t", "long long"),
-        ("uint64_t", "unsigned long long"),
-        ("int32_t", "int"),
-        ("uint32_t", "unsigned int"),
-        ("int16_t", "short"),
-        ("uint16_t", "unsigned short"),
-        ("int8_t", "char"),
-        ("uint8_t", "unsigned char"),
+    reps = [
+        ("__int64", "long long"), ("__int32", "int"), ("__int16", "short"),
+        ("__int8", "char"), ("_BYTE", "unsigned char"), ("_WORD", "unsigned short"),
+        ("_DWORD", "unsigned int"), ("_QWORD", "unsigned long long"),
+        ("__fastcall", ""), ("__cdecl", ""),
+        ("int64_t", "long long"), ("uint64_t", "unsigned long long"),
+        ("int32_t", "int"), ("uint32_t", "unsigned int"),
+        ("int16_t", "short"), ("uint16_t", "unsigned short"),
+        ("int8_t", "char"), ("uint8_t", "unsigned char"),
         ("size_t", "unsigned long long"),
     ]
-    for old, new in replacements:
+    for old, new in reps:
         code = code.replace(old, new)
-
-    # Step 7: Replace address references with NULL
-    # &off_XXXX, &unk_XXXX, etc. are binary-specific addresses
-    code = re.sub(r'&?off_[0-9a-fA-F]+', '0', code)
-    code = re.sub(r'&?unk_[0-9a-fA-F]+', '0', code)
-    
-    # Step 7: Replace unknown struct types with ThisStruct*
-    known_types = {"int", "long", "char", "void", "float", "double", "unsigned",
-                   "signed", "short", "struct", "union", "enum", "const", "static",
-                   "extern", "volatile", "inline", "register", "auto", "typedef",
-                   "if", "else", "while", "for", "do", "switch", "case", "break",
-                   "continue", "return", "goto", "sizeof", "NULL", "true", "false"}
-
-    def replace_unknown_type(match):
-        type_name = match.group(1)
-        if type_name.lower() in known_types or type_name.startswith("uint") or type_name.startswith("int"):
-            return match.group(0)
-        return f"ThisStruct* {match.group(2)}"
-
-    code = re.sub(r"(\w+)\s*\*\s*(\w+)", replace_unknown_type, code)
-
-    # Step 7: Add struct definition before the function
-    struct_def = "typedef struct { unsigned long long vtable, m_archive, m_name, m_fileSize, m_dataSize, m_offset, m_entryIndex, m_childCount, m_childList0, m_childList1, m_childList2; unsigned int m_flags, m_entryType; } ThisStruct;" + chr(10) + chr(10)
-    code = struct_def + code
-
-    # Generate stubs from pseudocode
-    from spectrida.verify.symbols import generate_symbol_stubs_from_pseudocode
-    symbol_stubs = generate_symbol_stubs_from_pseudocode(code)
-    
-    # Add common library function stubs
-    stubs = """// Common library stubs
-    
-// Macros for allocation
-static char _malloc_buf[4096];
-
-#define operator_new(s) ((long long)_malloc_buf)
-#define free(p) ((void)0)
-int printf(const char* fmt, ...) { return 0; }
-
-// Stub for sead::SafeStringBase
-static long long _safe_string_buf[100];
-#define sead_SafeStringBase_cNullChar ((long long)_safe_string_buf)
-
-// Stub for sead::FileDevice
-long long sead_FileDevice_tryIsExistFile(long long* args) { return 0; }
-
-// Stub for sead::Heap
-long long sead_Heap_alloc(long long* args) { return 0; }
-
-// Stub for al:: functions
-long long al_setNerve(long long* args) { return 0; }
-long long al_isNerve(long long* args) { return 0; }
-long long al_forceSetStopCalcAndDraw(long long* args) { return 0; }
-long long al_scaleVelocity(long long* args) { return 0; }
-long long al_getJointMtxPtr(long long* args) { return 0; }
-long long al_disconnectMtxConnector(long long* args) { return 0; }
-long long al_setQuat(long long* args) { return 0; }
-long long al_getCurrentKeyPlacementInfo(long long* args) { return 0; }
-long long al_getNextKeyTrans(long long* args) { return 0; }
-long long al_invalidateColliderRobustCheck(long long* args) { return 0; }
-
-// Stub for rs:: functions
-long long rs_isHoldHackJump(long long* args) { return 0; }
-
-// Stub for nn:: functions
-long long nn_nex_PRUDPEndPoint_ServiceIncomingP(long long* args) { return 0; }
-long long nn_nex_PRUDPStream_ReceiveIncomingPac(long long* args) { return 0; }
-long long nn_nex_NATTraversalEngine_SendProbeRe(long long* args) { return 0; }
-long long nn_nex_NATTraversalEngine_StopProbes(long long* args) { return 0; }
-long long nn_nex_ConnectionOrientedSocketManager(long long* args) { return 0; }
-
-// Stub for Concurrency:: functions
-long long Concurrency_missing_wait(long long* args) { return 0; }
-
-// Stub for agl:: functions
-long long agl_pfx_Sky_setUpShader(long long* args) { return 0; }
-long long agl_pfx_Bloom_draw(long long* args) { return 0; }
-
-// Stub for al::GraphicsQualityParam
-long long al_GraphicsQualityParam_GraphicsQualityParam(long long* args) { return 0; }
-#define free(p) ((void)0)
-"""
-    code = stubs + symbol_stubs + code
-    
+    known = {"int", "long", "char", "void", "float", "double", "unsigned",
+             "signed", "short", "struct", "union", "enum", "const", "static",
+             "extern", "volatile", "inline", "register", "auto", "typedef"}
+    def fix(m):
+        tn = m.group(1)
+        if tn.lower() in known or tn.startswith("uint") or tn.startswith("int"):
+            return m.group(0)
+        return "ThisStruct* " + m.group(2)
+    code = re.sub(r"(\w+)\s*\*\s*(\w+)", fix, code)
+    code = re.sub(r"&?off_[0-9a-fA-F]+", "0", code)
+    code = re.sub(r"&?unk_[0-9a-fA-F]+", "0", code)
+    sd = "typedef struct { unsigned long long vtable, m_archive, m_name, m_fileSize, m_dataSize, m_offset, m_entryIndex, m_childCount, m_childList0, m_childList1, m_childList2; unsigned int m_flags, m_entryType; } ThisStruct;" + NL + NL
+    code = sd + code
     return code
 
 
+LIFT_SYSTEM = "You are an expert C programmer. Given Hex-Rays pseudocode, produce compilable C. Use GCC-compatible types. No placeholders. No external calls. Just the function."
+
+LIFT_PROMPT_TEMPLATE = "Convert this pseudocode to compilable C.\n\nCallee prototypes:\n{callee_prototypes}\n\n{struct_context}\n```c\n{pseudocode}\n```\n\nReturn ONLY the C code."
+
+
+async def _query_model(http, ollama_url, system, user_msg, *, ollama_model=""):
+    prompt = _LT + "im" + _GT + "system" + _LT + "/im" + _GT + NL + system + _LT + "/im" + _GT + NL + _LT + "im" + _GT + "user" + _LT + "/im" + _GT + NL + user_msg + _LT + "/im" + _GT + NL + _LT + "im" + _GT + "assistant" + _LT + "/im" + _GT + NL
+    if ollama_model:
+        url = ollama_url.rstrip("/") + "/api/generate"
+        payload = {"model": ollama_model, "prompt": prompt, "stream": False, "think": False,
+                   "options": {"temperature": 0.3, "num_predict": 1024}}
+        resp = await http.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    else:
+        payload = {"prompt": prompt, "temperature": 0.3, "n_predict": 1024}
+        resp = await http.post(ollama_url, json=payload)
+        resp.raise_for_status()
+        return resp.json().get("content", "").strip()
+
+
 def _extract_c_code(text: str) -> str:
-    """Extract C code from model response (strip markdown, comments, etc.)."""
-    # Remove markdown code blocks
-    text = re.sub(r'```c?\s*\n?', '', text)
-    text = re.sub(r'```\s*$', '', text, flags=re.MULTILINE)
-
-    # Remove leading/trailing whitespace
+    text = re.sub(r"```c?\s*\n?", "", text)
+    text = re.sub(r"```\s*$", "", text, flags=re.MULTILINE)
     text = text.strip()
-
-    # If it starts with a comment, skip to the function
-    lines = text.split('\n')
+    lines = text.split(NL)
     start = 0
     for i, line in enumerate(lines):
-        if re.match(r'^\s*(typedef|struct|static|void|int|long|char|unsigned|float|double|__int|const|inline)', line):
+        if re.match(r"^\s*(typedef|struct|static|void|int|long|char|unsigned|float|double|__int|const|inline)", line):
             start = i
             break
+    return NL.join(lines[start:]).strip()
 
-    return '\n'.join(lines[start:]).strip()
-
-
-# ── Oracle interaction ───────────────────────────────────────────────────────
-
-def _build_verdict_feedback(verdict: OracleVerdict, c_code: str) -> str:
-    """Build a feedback string from a failed oracle verdict."""
-    parts = []
-
-    if not verdict.return_match:
-        parts.append(f"Return value mismatch: original={verdict.details}")
-
-    if not verdict.memory_match:
-        parts.append(f"Memory write mismatch: the function writes to different addresses or with different values than expected.")
-
-    if verdict.reason:
-        parts.append(f"Oracle verdict: {verdict.reason}")
-
-    return "\n".join(parts)
-
-
-# ── Main loop ────────────────────────────────────────────────────────────────
 
 async def lift_function(
-    pseudocode: str,
-    original_bytes: bytes,
-    func_name: str = "target",
+    pseudocode,
+    original_bytes,
+    func_name="",
     *,
-    http: httpx.AsyncClient | None = None,
-    ollama_url: str = "",
-    ollama_model: str = "",
-    max_attempts: int = 3,
-    args: list[int] | None = None,
-) -> LiftResult:
-    """Self-verifying decompilation loop.
-
-    1. Ask model to convert pseudocode to C
-    2. Compile the C
-    3. Emulate both original and recompiled
-    4. Compare via oracle
-    5. On mismatch, feed back the error and retry
-
-    Returns LiftResult with the verified C (if successful) and all attempts.
-    """
+    http=None,
+    ollama_url="",
+    ollama_model="",
+    max_attempts=3,
+    args=None,
+):
     import httpx as _httpx
-
     if http is None:
         http = _httpx.AsyncClient(timeout=120)
         own_client = True
@@ -386,64 +137,28 @@ async def lift_function(
         own_client = False
 
     result = LiftResult(func_name=func_name)
-    previous_c = ""
 
     try:
         for attempt_num in range(1, max_attempts + 1):
             attempt = LiftAttempt(attempt_num=attempt_num)
+            struct_ctx = _extract_struct_context(pseudocode)
 
-            # Analyze function context
-            ctx = estimate_function_complexity(pseudocode)
-            externals = find_external_calls(pseudocode)
-            
-            # 1. Build prompt
-            if previous_c and attempt_num > 1:
-                user_msg = REPAIR_PROMPT_TEMPLATE.format(
-                    feedback=last_feedback,
-                    pseudocode=pseudocode,
-                    previous_c=previous_c,
-                )
-            else:
-                struct_ctx = _extract_struct_context(pseudocode)
-            
-            # Extract callee prototypes from pseudocode and graph
-            import re
             callees = set()
-            for m in re.finditer(r'([A-Z]\w*(?:::[A-Z]\w*)*)\s*\(', pseudocode):
+            for m in re.finditer(r"([A-Z]\w*(?:::[A-Z]\w*)*)\s*\(", pseudocode):
                 callees.add(m.group(1))
-            
-            # Get actual function signatures from the graph
             callee_protos = []
             for c in sorted(callees):
-                # Check if we have the actual signature
-                try:
-                    with g.driver.session() as s:
-                        row = s.run("MATCH (f:Function {binary: 'main.nso'}) WHERE f.name CONTAINS  RETURN f.pseudocode AS pseudo LIMIT 1", name=c).single()
-                        if row and row['pseudo']:
-                            # Extract just the function signature
-                            sig_match = re.search(r'(\w+\s+\w+\([^)]+\))', row['pseudo'])
-                            if sig_match:
-                                callee_protos.append(sig_match.group(1) + ';')
-                                continue
-                except Exception:
-                    pass
-                # Fallback to generic stub
-                callee_protos.append(f'long long {c.replace("::", "_")}(long long* args);')
-            
-            callee_protos = chr(10).join(callee_protos)
-            
+                callee_protos.append(f"long long {c.replace('::', '_')}(long long* args);")
+            callee_protos_str = NL.join(callee_protos)
+
             user_msg = LIFT_PROMPT_TEMPLATE.format(
-                callee_prototypes=callee_protos,
+                callee_prototypes=callee_protos_str,
                 struct_context=struct_ctx,
                 pseudocode=pseudocode,
             )
 
-            # 2. Query model
             try:
-                raw_response = await _query_model(
-                    http, ollama_url, LIFT_SYSTEM, user_msg,
-                    ollama_model=ollama_model,
-                )
+                raw_response = await _query_model(http, ollama_url, LIFT_SYSTEM, user_msg, ollama_model=ollama_model)
                 c_code = _normalize_types(_extract_c_code(raw_response))
                 attempt.c_code = c_code
             except Exception as e:
@@ -456,52 +171,26 @@ async def lift_function(
                 result.attempts.append(attempt)
                 continue
 
-            # 3. Compile
-            import tempfile as _tf; _fd, _dll = _tf.mkstemp(suffix=".dll"); os.close(_fd); compile_result = compile_c_to_shared(c_code, _dll)
+            import tempfile as _tf
+            fd, _dll = _tf.mkstemp(suffix=".dll")
+            os.close(fd)
+            compile_result = compile_c_to_shared(c_code, _dll)
             if not compile_result["ok"]:
                 attempt.compile_error = compile_result["error"][:300]
                 result.attempts.append(attempt)
-                last_feedback = f"Compilation failed:\n{attempt.compile_error}"
                 continue
 
             attempt.compiled = True
 
-            # 4. Capture external calls from original
-            externals = find_external_calls(pseudocode)
-            if externals:
-                capture_result = capture_external_calls(
-                    original_bytes,
-                    args=args if args else [0, 0, 0, 0],
-                )
-                # 5. Extract bytes from compiled
-            extract_result = extract_function_bytes(
-                _dll, func_name
-            )
+            extract_result = extract_function_bytes(_dll, func_name)
             if not extract_result["ok"]:
-                attempt.oracle_error = f"extract failed: {extract_result['error']}"
+                attempt.compile_error = f"extract failed: {extract_result['error']}"
                 result.attempts.append(attempt)
-                last_feedback = attempt.oracle_error
                 continue
 
             recompiled_bytes = bytes.fromhex(extract_result["bytes"])
-
-            # 5. Emulate original
-            orig_result = emulate_function(original_bytes, args=args)
-            if orig_result.error:
-                attempt.oracle_error = f"original emulation failed: {orig_result.error}"
-                result.attempts.append(attempt)
-                last_feedback = attempt.oracle_error
-                continue
-
-            # 6. Emulate recompiled
-            recomp_result = emulate_function(recompiled_bytes, args=args)
-            if recomp_result.error:
-                attempt.oracle_error = f"recompiled emulation failed: {recomp_result.error}"
-                result.attempts.append(attempt)
-                last_feedback = attempt.oracle_error
-                continue
-
-            # 7. Compare
+            orig_result = emulate_function(original_bytes, args=args or [0, 0, 0, 0])
+            recomp_result = emulate_function(recompiled_bytes, args=args or [0, 0, 0, 0])
             verdict = compare_emulations(orig_result, recomp_result)
             attempt.verdict = verdict
 
@@ -513,9 +202,7 @@ async def lift_function(
                 result.attempts.append(attempt)
                 break
             else:
-                last_feedback = _build_verdict_feedback(verdict, c_code)
                 result.attempts.append(attempt)
-                previous_c = c_code
 
     finally:
         if own_client:
