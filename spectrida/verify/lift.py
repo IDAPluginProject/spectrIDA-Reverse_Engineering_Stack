@@ -65,6 +65,7 @@ def _normalize_types(code: str) -> str:
         ("int16_t", "short"), ("uint16_t", "unsigned short"),
         ("int8_t", "char"), ("uint8_t", "unsigned char"),
         ("size_t", "unsigned long long"),
+        ("ulong", "unsigned long"),
     ]
     for old, new in reps:
         code = code.replace(old, new)
@@ -89,7 +90,7 @@ LIFT_SYSTEM = "You are an expert C programmer. Given Hex-Rays pseudocode, produc
 LIFT_PROMPT_TEMPLATE = "Convert this pseudocode to compilable C.\n\nCallee prototypes:\n{callee_prototypes}\n\n{struct_context}\n```c\n{pseudocode}\n```\n\nReturn ONLY the C code."
 
 
-async def _query_model(http, ollama_url, system, user_msg, *, ollama_model=""):
+async def _query_model(http, ollama_url, system, user_msg, *, ollama_model="", use_claude=False):
     prompt = _LT + "im" + _GT + "system" + _LT + "/im" + _GT + NL + system + _LT + "/im" + _GT + NL + _LT + "im" + _GT + "user" + _LT + "/im" + _GT + NL + user_msg + _LT + "/im" + _GT + NL + _LT + "im" + _GT + "assistant" + _LT + "/im" + _GT + NL
     if ollama_model:
         url = ollama_url.rstrip("/") + "/api/generate"
